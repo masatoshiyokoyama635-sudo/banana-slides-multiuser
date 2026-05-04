@@ -65,11 +65,16 @@ def app():
 
 
 @pytest.fixture(scope='function')
-def client(app):
-    """创建测试客户端"""
+def unauthenticated_client(app):
+    """Create a test client without an authenticated session."""
+    original_rate_limit_attempts = app.config.get('AUTH_RATE_LIMIT_ATTEMPTS')
+    original_rate_limit_window = app.config.get('AUTH_RATE_LIMIT_WINDOW_SECONDS')
+    original_trusted_proxies = app.config.get('AUTH_TRUSTED_PROXIES')
     with app.test_client() as test_client:
         with app.app_context():
+            from controllers.auth_controller import reset_auth_rate_limits
             from models import db
+            reset_auth_rate_limits()
             # 清理旧数据，保持测试隔离
             db.session.rollback()
             for table in reversed(db.metadata.sorted_tables):
@@ -77,6 +82,25 @@ def client(app):
             db.session.commit()
             yield test_client
             db.session.rollback()
+            reset_auth_rate_limits()
+            app.config['AUTH_RATE_LIMIT_ATTEMPTS'] = original_rate_limit_attempts
+            app.config['AUTH_RATE_LIMIT_WINDOW_SECONDS'] = original_rate_limit_window
+            app.config['AUTH_TRUSTED_PROXIES'] = original_trusted_proxies
+
+
+@pytest.fixture(scope='function')
+def client(unauthenticated_client):
+    """Create an authenticated test client for protected API tests."""
+    response = unauthenticated_client.post('/api/auth/register', json={
+        'email': 'tester@example.com',
+        'password': 'Password123!',
+        'name': 'tester',
+    })
+    assert response.status_code == 201
+    with unauthenticated_client.application.app_context():
+        from controllers.auth_controller import reset_auth_rate_limits
+        reset_auth_rate_limits()
+    return unauthenticated_client
 
 
 @pytest.fixture(scope='function')

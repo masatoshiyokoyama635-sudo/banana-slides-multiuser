@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Home, Trash2, Sun, Moon } from 'lucide-react';
-import { Button, Loading, Card, Pagination, useToast, useConfirm } from '@/components/shared';
+import { Button, Loading, Card, Pagination, useToast, useConfirm, LogoutButton } from '@/components/shared';
 import { ProjectCard } from '@/components/history/ProjectCard';
 import { useProjectStore } from '@/store/useProjectStore';
 import { useTheme } from '@/hooks/useTheme';
@@ -403,6 +403,7 @@ export const History: React.FC = () => {
             >
               {isDark ? <Sun size={16} /> : <Moon size={16} />}
             </button>
+            <LogoutButton compact />
           </div>
         </div>
       </nav>

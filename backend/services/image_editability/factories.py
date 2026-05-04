@@ -328,9 +328,8 @@ class InpaintProviderFactory:
             如果AI服务初始化失败，会抛出异常
         """
         if ai_service is None:
-            from services.ai_service_manager import get_ai_service
-            ai_service = get_ai_service()
-        
+            raise ValueError("ai_service is required for generative image editing")
+
         logger.info("创建GenerativeEditInpaintProvider")
         return GenerativeEditInpaintProvider(ai_service, aspect_ratio, resolution)
     
@@ -357,8 +356,8 @@ class InpaintProviderFactory:
         if mask_provider is None:
             mask_provider = InpaintProviderFactory.create_default_provider()
         
-        if generative_provider is None:
-            generative_provider = InpaintProviderFactory.create_generative_edit_provider()
+        if generative_provider is None and default_provider_type == "generative":
+            raise ValueError("generative_provider is required when default_provider_type is generative")
         
         # 创建注册表
         registry = InpaintProviderRegistry()
@@ -441,16 +440,24 @@ class InpaintProviderFactory:
             return None
         
         # 创建生成式提供者（用于画质提升）
-        if generative_provider is None:
+        if enhance_quality and generative_provider is None:
             generative_provider = InpaintProviderFactory.create_generative_edit_provider(
                 ai_service=ai_service
             )
-        
-        logger.info("✅ 创建HybridInpaintProvider（百度修复 + 生成式画质提升）")
+
+        if enhance_quality:
+            logger.info("✅ 创建HybridInpaintProvider（百度修复 + 生成式画质提升）")
+            return HybridInpaintProvider(
+                baidu_provider=baidu_provider,
+                generative_provider=generative_provider,
+                enhance_quality=True
+            )
+
+        logger.info("✅ 创建HybridInpaintProvider（仅百度修复）")
         return HybridInpaintProvider(
             baidu_provider=baidu_provider,
-            generative_provider=generative_provider,
-            enhance_quality=enhance_quality
+            generative_provider=None,
+            enhance_quality=False
         )
 
 
@@ -697,9 +704,8 @@ class TextAttributeExtractorFactory:
             如果AI服务初始化失败，会抛出异常
         """
         if ai_service is None:
-            from services.ai_service_manager import get_ai_service
-            ai_service = get_ai_service()
-        
+            raise ValueError("ai_service is required for caption model extraction")
+
         logger.info("创建CaptionModelTextAttributeExtractor")
         return CaptionModelTextAttributeExtractor(ai_service, prompt_template)
     

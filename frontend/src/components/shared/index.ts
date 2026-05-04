@@ -27,5 +27,7 @@ export { HelpModal } from './HelpModal';
 export { ProjectSettingsModal } from './ProjectSettingsModal';
 export { ExportTasksPanel } from './ExportTasksPanel';
 export { AccessCodeGuard } from './AccessCodeGuard';
+export { AuthGuard } from './AuthGuard';
+export { LogoutButton } from './LogoutButton';
 export { TextStyleSelector } from './TextStyleSelector';
 export { Pagination } from './Pagination';

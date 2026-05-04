@@ -125,6 +125,15 @@ export interface ApiResponse<T = any> {
   error?: string;
 }
 
+// 用户
+export interface User {
+  id: string;
+  email: string;
+  name?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
 // 设置
 export interface Settings {
   id: number;

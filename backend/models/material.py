@@ -13,7 +13,8 @@ class Material(db.Model):
     __tablename__ = 'materials'
     
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id = db.Column(db.String(36), db.ForeignKey('projects.id'), nullable=True)  # Can be null, for global materials not belonging to a project
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True, index=True)
+    project_id = db.Column(db.String(36), db.ForeignKey('projects.id'), nullable=True)  # Can be null, for user-level materials not belonging to a project
     filename = db.Column(db.String(500), nullable=False)
     relative_path = db.Column(db.String(500), nullable=False)  # Path relative to the upload_folder
     url = db.Column(db.String(500), nullable=False)  # URL accessible by the frontend
@@ -29,6 +30,7 @@ class Material(db.Model):
         """Convert to dictionary"""
         return {
             'id': self.id,
+            'user_id': self.user_id,
             'project_id': self.project_id,
             'filename': self.filename,
             'url': self.url,

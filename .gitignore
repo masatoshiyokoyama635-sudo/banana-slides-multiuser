@@ -41,6 +41,8 @@
 !.github/**/*.md
 *.pyc
 .env
+.pydeps/
+.cache/
 
 # GCP service-account key (sensitive — never commit)
 gcp-service-account.json

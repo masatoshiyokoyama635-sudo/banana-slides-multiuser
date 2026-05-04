@@ -2,8 +2,6 @@
 Backend configuration file
 """
 import os
-import sys
-from datetime import timedelta
 
 # 基础配置 - 使用更可靠的路径计算方式
 # 在模块加载时立即计算并固定路径
@@ -46,7 +44,7 @@ class Config:
     GOOGLE_API_BASE = os.getenv('GOOGLE_API_BASE', '')
     
     # Provider format: gemini | openai | vertex | lazyllm
-    AI_PROVIDER_FORMAT = os.getenv('AI_PROVIDER_FORMAT', 'gemini')
+    AI_PROVIDER_FORMAT = os.getenv('AI_PROVIDER_FORMAT', 'openai')
 
     # Google Cloud Vertex AI (requires AI_PROVIDER_FORMAT=vertex)
     VERTEX_PROJECT_ID = os.getenv('VERTEX_PROJECT_ID', '')
@@ -58,7 +56,7 @@ class Config:
     
     # OpenAI 格式专用配置（当 AI_PROVIDER_FORMAT=openai 时使用）
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')  # 当 AI_PROVIDER_FORMAT=openai 时必须设置
-    OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', 'https://aihubmix.com/v1')
+    OPENAI_API_BASE = os.getenv('OPENAI_API_BASE', 'https://ai.zh-zh.top/v1')
     OPENAI_TIMEOUT = float(os.getenv('OPENAI_TIMEOUT', '480.0'))  # 8 分钟：留出 gpt-image-2 生图(~225s)+传输的余量
     OPENAI_MAX_RETRIES = int(os.getenv('OPENAI_MAX_RETRIES', '2'))  # 减少重试次数，避免过多重试导致累积超时
 
@@ -87,15 +85,15 @@ class Config:
     IMAGE_CAPTION_API_BASE = os.getenv('IMAGE_CAPTION_API_BASE', '')
     
     # AI 模型配置
-    TEXT_MODEL = os.getenv('TEXT_MODEL', 'gemini-3-flash-preview')
-    IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'gemini-3-pro-image-preview')
+    TEXT_MODEL = os.getenv('TEXT_MODEL', 'gpt-5.5')
+    IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'gpt-image-2')
 
     # MinerU 文件解析服务配置
     MINERU_TOKEN = os.getenv('MINERU_TOKEN', '')
     MINERU_API_BASE = os.getenv('MINERU_API_BASE', 'https://mineru.net')
     
     # 图片识别模型配置
-    IMAGE_CAPTION_MODEL = os.getenv('IMAGE_CAPTION_MODEL', 'gemini-3-flash-preview')
+    IMAGE_CAPTION_MODEL = os.getenv('IMAGE_CAPTION_MODEL', 'gpt-5.5')
     
     # 并发配置
     MAX_DESCRIPTION_WORKERS = int(os.getenv('MAX_DESCRIPTION_WORKERS', '20'))
@@ -112,9 +110,21 @@ class Config:
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:3000').split(',')
     
     # 输出语言配置
-    # 可选值: 'zh' (中文), 'ja' (日本語), 'en' (English), 'auto' (自动)
+    # 可选值: 'zh' (中文), 'ja', 'en', 'auto'
     OUTPUT_LANGUAGE = os.getenv('OUTPUT_LANGUAGE', 'zh')
-    
+
+    # Auth rate limiting
+    AUTH_RATE_LIMIT_ATTEMPTS = int(os.getenv('AUTH_RATE_LIMIT_ATTEMPTS', '20'))
+    AUTH_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv('AUTH_RATE_LIMIT_WINDOW_SECONDS', '300'))
+    AUTH_TRUSTED_PROXIES = [
+        proxy.strip()
+        for proxy in os.getenv(
+            'AUTH_TRUSTED_PROXIES',
+            '127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+        ).split(',')
+        if proxy.strip()
+    ]
+
     # 火山引擎配置
     VOLCENGINE_ACCESS_KEY = os.getenv('VOLCENGINE_ACCESS_KEY', '')
     VOLCENGINE_SECRET_KEY = os.getenv('VOLCENGINE_SECRET_KEY', '')

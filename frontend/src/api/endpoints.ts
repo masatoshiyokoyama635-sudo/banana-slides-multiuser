@@ -1,6 +1,42 @@
 import { apiClient } from './client';
-import type { Project, Task, ApiResponse, CreateProjectRequest, Page } from '@/types';
+import type { Project, Task, ApiResponse, CreateProjectRequest, Page, User } from '@/types';
 import type { Settings } from '../types/index';
+
+// ===== 认证 API =====
+
+export interface AuthCredentials {
+  email: string;
+  password: string;
+}
+
+export interface RegisterCredentials extends AuthCredentials {
+  name?: string;
+}
+
+export interface AuthSession {
+  authenticated: boolean;
+  user: User | null;
+}
+
+export const register = async (data: RegisterCredentials): Promise<ApiResponse<{ user: User }>> => {
+  const response = await apiClient.post<ApiResponse<{ user: User }>>('/api/auth/register', data);
+  return response.data;
+};
+
+export const login = async (data: AuthCredentials): Promise<ApiResponse<{ user: User }>> => {
+  const response = await apiClient.post<ApiResponse<{ user: User }>>('/api/auth/login', data);
+  return response.data;
+};
+
+export const logout = async (): Promise<ApiResponse> => {
+  const response = await apiClient.post<ApiResponse>('/api/auth/logout');
+  return response.data;
+};
+
+export const getCurrentUser = async (): Promise<ApiResponse<AuthSession>> => {
+  const response = await apiClient.get<ApiResponse<AuthSession>>('/api/auth/me');
+  return response.data;
+};
 
 // ===== 访问口令 API =====
 
@@ -155,6 +191,7 @@ export const generateOutlineStream = async (
 
   const response = await fetch(`/api/projects/${projectId}/generate/outline/stream`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(accessCode ? { 'X-Access-Code': accessCode } : {}),
@@ -268,6 +305,7 @@ export const generateDescriptionsStream = async (
 
   const response = await fetch(`/api/projects/${projectId}/generate/descriptions/stream`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(accessCode ? { 'X-Access-Code': accessCode } : {}),
@@ -1067,15 +1105,7 @@ export const getSettings = async (): Promise<ApiResponse<Settings>> => {
  * 更新系统设置
  */
 export const updateSettings = async (
-  data: Partial<Omit<Settings, 'id' | 'api_key_length' | 'mineru_token_length' | 'baidu_api_key_length' | 'created_at' | 'updated_at'>> & { 
-    api_key?: string;
-    mineru_token?: string;
-    baidu_api_key?: string;
-    text_api_key?: string;
-    image_api_key?: string;
-    image_caption_api_key?: string;
-    lazyllm_api_keys?: Record<string, string>;
-  }
+  data: { api_key?: string; output_language?: OutputLanguage }
 ): Promise<ApiResponse<Settings>> => {
   const response = await apiClient.put<ApiResponse<Settings>>('/api/settings', data);
   return response.data;
@@ -1102,20 +1132,6 @@ export const verifyApiKey = async (): Promise<ApiResponse<{ available: boolean; 
  */
 export interface TestSettingsOverride {
   api_key?: string;
-  api_base_url?: string;
-  text_model?: string;
-  image_model?: string;
-  image_caption_model?: string;
-  image_caption_model_source?: string;
-  mineru_api_base?: string;
-  mineru_token?: string;
-  baidu_api_key?: string;
-  ai_provider_format?: string;
-  image_resolution?: string;
-  enable_text_reasoning?: boolean;
-  text_thinking_budget?: number;
-  enable_image_reasoning?: boolean;
-  image_thinking_budget?: number;
 }
 
 /**

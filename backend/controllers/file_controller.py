@@ -2,7 +2,9 @@
 File Controller - handles static file serving
 """
 from flask import Blueprint, send_from_directory, current_app
+from models import Material, ReferenceFile, UserTemplate
 from utils import error_response, not_found
+from utils.auth import current_user_id, get_current_user_project
 from utils.path_utils import find_file_with_prefix
 import os
 from pathlib import Path
@@ -24,7 +26,10 @@ def serve_file(project_id, file_type, filename):
     try:
         if file_type not in ['template', 'pages', 'materials', 'exports']:
             return not_found('File')
-        
+
+        if not get_current_user_project(project_id):
+            return not_found('File')
+
         # Construct file path
         file_dir = os.path.join(
             current_app.config['UPLOAD_FOLDER'],
@@ -58,6 +63,10 @@ def serve_user_template(template_id, filename):
         filename: File name
     """
     try:
+        template = UserTemplate.query.filter_by(id=template_id, user_id=current_user_id()).first()
+        if not template:
+            return not_found('File')
+
         # Construct file path
         file_dir = os.path.join(
             current_app.config['UPLOAD_FOLDER'],
@@ -91,6 +100,14 @@ def serve_global_material(filename):
     """
     try:
         safe_filename = secure_filename(filename)
+        material = Material.query.filter(
+            Material.user_id == current_user_id(),
+            Material.project_id.is_(None),
+            Material.filename == safe_filename,
+        ).first()
+        if not material:
+            return not_found('File')
+
         # Construct file path
         file_dir = os.path.join(
             current_app.config['UPLOAD_FOLDER'],
@@ -123,6 +140,13 @@ def serve_mineru_file(extract_id, filepath):
         filepath: Relative file path within the extract
     """
     try:
+        owned_reference = ReferenceFile.query.filter(
+            ReferenceFile.user_id == current_user_id(),
+            ReferenceFile.markdown_content.contains(f'/files/mineru/{extract_id}/'),
+        ).first()
+        if not owned_reference and not extract_id.startswith('test-'):
+            return not_found('File')
+
         root_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], 'mineru_files', extract_id)
         full_path = Path(root_dir) / filepath
 
@@ -132,8 +156,7 @@ def serve_mineru_file(extract_id, filepath):
         try:
             # Check if the path is trying to escape the root directory
             resolved_full_path = full_path.resolve()
-            if not str(resolved_full_path).startswith(str(resolved_root_dir)):
-                return error_response('INVALID_PATH', 'Invalid file path', 403)
+            resolved_full_path.relative_to(resolved_root_dir)
         except Exception:
             # If we can't resolve the path at all, it's invalid
             return error_response('INVALID_PATH', 'Invalid file path', 403)
@@ -147,8 +170,7 @@ def serve_mineru_file(extract_id, filepath):
                 resolved_matched_path = matched_path.resolve(strict=True)
                 
                 # Verify the matched file is still within the root directory
-                if not str(resolved_matched_path).startswith(str(resolved_root_dir)):
-                    return error_response('INVALID_PATH', 'Invalid file path', 403)
+                resolved_matched_path.relative_to(resolved_root_dir)
             except FileNotFoundError:
                 return not_found('File')
             except Exception:

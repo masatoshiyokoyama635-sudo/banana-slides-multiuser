@@ -11,11 +11,13 @@ db = SQLAlchemy(
         'pool_pre_ping': True,  # 连接前检查，确保连接有效
         'pool_recycle': 3600,  # 1小时回收连接，释放文件句柄
         'pool_size': 5,  # SQLite连接池不需要太大（建议5-10）
-        'max_overflow': 10,  # 溢出连接数（SQLite受文件锁限制，不宜过大）
+        'max_overflow': 10,  # 溢出连接数（SQLite受文件锁限制，不宜太大）
         'pool_timeout': 30,  # 获取连接的超时时间（秒）
     }
 )
 
+from .user import User
+from .user_settings import UserSettings
 from .project import Project
 from .page import Page
 from .task import Task
@@ -25,5 +27,17 @@ from .material import Material
 from .reference_file import ReferenceFile
 from .settings import Settings
 
-__all__ = ['db', 'Project', 'Page', 'Task', 'UserTemplate', 'PageImageVersion', 'Material', 'ReferenceFile', 'Settings']
+__all__ = [
+    'db',
+    'User',
+    'UserSettings',
+    'Project',
+    'Page',
+    'Task',
+    'UserTemplate',
+    'PageImageVersion',
+    'Material',
+    'ReferenceFile',
+    'Settings',
+]
 

@@ -4,8 +4,9 @@ Material Controller - handles standalone material image generation
 from flask import Blueprint, request, current_app, send_file
 from models import db, Project, Material, Task
 from utils import success_response, error_response, not_found, bad_request
+from utils.auth import current_user_id, get_current_user_project
 from services import FileService
-from services.ai_service_manager import get_ai_service
+from services.user_ai import create_user_ai_service, get_user_ai_config
 from services.task_manager import task_manager, generate_material_image_task
 from pathlib import Path
 from werkzeug.utils import secure_filename
@@ -14,8 +15,6 @@ import tempfile
 import shutil
 import time
 import zipfile
-import io
-import base64
 import logging
 
 logger = logging.getLogger(__name__)
@@ -32,87 +31,40 @@ def _generate_image_caption(filepath: str) -> str:
     if filepath.lower().endswith('.svg'):
         return ""
     try:
-        from PIL import Image
-
-        image = Image.open(filepath)
-        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-
-        output_lang = current_app.config.get('OUTPUT_LANGUAGE', 'zh')
-        if output_lang == 'en':
+        config = get_user_ai_config(current_user_id())
+        if config.output_language == 'en':
             prompt = "Please provide a short description of the main content of this image. Return only the description text without any other explanation."
         else:
             prompt = "请用一句简短的中文描述这张图片的主要内容。只返回描述文字，不要其他解释。"
 
-        provider_format = (current_app.config.get('AI_PROVIDER_FORMAT') or 'gemini').lower()
-        caption_model = current_app.config.get('IMAGE_CAPTION_MODEL', 'gemini-3-flash-preview')
-
-        if provider_format == 'openai':
-            from openai import OpenAI
-            api_key = current_app.config.get('OPENAI_API_KEY', '')
-            if not api_key:
-                return ""
-            client = OpenAI(
-                api_key=api_key,
-                base_url=current_app.config.get('OPENAI_API_BASE') or None
-            )
-
-            buffered = io.BytesIO()
-            if image.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
-                image = background
-            image.save(buffered, format="JPEG", quality=95)
-            base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-            response = client.chat.completions.create(
-                model=caption_model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                        {"type": "text", "text": prompt}
-                    ]
-                }],
-                temperature=0.3
-            )
-            return response.choices[0].message.content.strip()
-        else:
-            # Gemini (default)
-            from google import genai
-            from google.genai import types
-            api_key = current_app.config.get('GOOGLE_API_KEY', '')
-            if not api_key:
-                return ""
-            api_base = current_app.config.get('GOOGLE_API_BASE', '')
-            client = genai.Client(
-                http_options=types.HttpOptions(base_url=api_base) if api_base else None,
-                api_key=api_key
-            )
-            result = client.models.generate_content(
-                model=caption_model,
-                contents=[image, prompt],
-                config=types.GenerateContentConfig(temperature=0.3)
-            )
-            return result.text.strip()
+        return create_user_ai_service(current_user_id())._generate_text_from_image(prompt, filepath)
     except Exception as e:
         logger.warning(f"Failed to generate caption for {filepath}: {e}")
         return ""
 
 
+def _get_user_project_or_404(project_id: str):
+    project = get_current_user_project(project_id)
+    if not project:
+        return None, not_found('Project')
+    return project, None
+
+
 def _build_material_query(filter_project_id: str):
     """Build common material query with project validation."""
-    query = Material.query
+    user_id = current_user_id()
+    query = Material.query.filter(Material.user_id == user_id)
 
     if filter_project_id == 'all':
         return query, None
     if filter_project_id == 'none':
         return query.filter(Material.project_id.is_(None)), None
 
-    project = Project.query.get(filter_project_id)
-    if not project:
-        return None, not_found('Project')
+    project, error = _get_user_project_or_404(filter_project_id)
+    if error:
+        return None, error
 
-    return query.filter(Material.project_id == filter_project_id), None
+    return query.filter(Material.project_id == project.id), None
 
 
 def _get_materials_list(filter_project_id: str):
@@ -177,9 +129,9 @@ def _resolve_target_project_id(raw_project_id: Optional[str], allow_none: bool =
         return None, bad_request("project_id cannot be 'all' when uploading materials")
 
     if raw_project_id:
-        project = Project.query.get(raw_project_id)
-        if not project:
-            return None, not_found('Project')
+        project, error = _get_user_project_or_404(raw_project_id)
+        if error:
+            return None, error
 
     return raw_project_id, None
 
@@ -215,6 +167,7 @@ def _save_material_file(file, target_project_id: Optional[str]):
         image_url = f"/files/materials/{unique_filename}"
 
     material = Material(
+        user_id=current_user_id(),
         project_id=target_project_id,
         filename=unique_filename,
         relative_path=relative_path,
@@ -244,14 +197,14 @@ def generate_material_image(project_id):
     Note: project_id can be 'none' to generate global materials (not associated with any project)
     """
     try:
-        # 支持 'none' 作为特殊值，表示生成全局素材
+        # 支持 'none' 作为特殊值，表示生成用户级素材
         if project_id != 'none':
-            project = Project.query.get(project_id)
-            if not project:
-                return not_found('Project')
+            project, error = _get_user_project_or_404(project_id)
+            if error:
+                return error
         else:
             project = None
-            project_id = None  # 设置为None表示全局素材
+            project_id = None
 
         # Parse request data (prioritize multipart for file uploads)
         if request.is_json:
@@ -272,18 +225,10 @@ def generate_material_image(project_id):
         if not prompt:
             return bad_request("prompt is required")
 
-        # 处理project_id：对于全局素材，使用'global'作为Task的project_id
-        # Task模型要求project_id不能为null，但Material可以
-        task_project_id = project_id if project_id is not None else 'global'
-        
-        # 验证project_id（如果不是'global'）
-        if task_project_id != 'global':
-            project = Project.query.get(task_project_id)
-            if not project:
-                return not_found('Project')
+        task_project_id = project_id if project_id is not None else None
 
         # Initialize services
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
 
         # 创建临时目录保存参考图片（后台任务会清理）
@@ -313,6 +258,7 @@ def generate_material_image(project_id):
 
             # Create async task for material generation
             task = Task(
+                user_id=current_user_id(),
                 project_id=task_project_id,
                 task_type='GENERATE_MATERIAL',
                 status='PENDING'
@@ -332,7 +278,7 @@ def generate_material_image(project_id):
             task_manager.submit_task(
                 task.id,
                 generate_material_image_task,
-                task_project_id,  # 传递给任务函数，它会处理'global'的情况
+                task_project_id,
                 prompt,
                 ai_service,
                 file_service,
@@ -448,7 +394,7 @@ def delete_material(material_id):
     DELETE /api/materials/{material_id} - Delete a material and its file
     """
     try:
-        material = Material.query.get(material_id)
+        material = Material.query.filter_by(id=material_id, user_id=current_user_id()).first()
         if not material:
             return not_found('Material')
 
@@ -499,18 +445,19 @@ def associate_materials_to_project():
             return bad_request("material_urls must be a non-empty array")
 
         # Validate project exists
-        project = Project.query.get(project_id)
-        if not project:
-            return not_found('Project')
+        project, error = _get_user_project_or_404(project_id)
+        if error:
+            return error
 
         # Find materials by URLs and update their project_id
         updated_ids = []
         materials_to_update = Material.query.filter(
+            Material.user_id == current_user_id(),
             Material.url.in_(material_urls),
             Material.project_id.is_(None)
         ).all()
         for material in materials_to_update:
-            material.project_id = project_id
+            material.project_id = project.id
             updated_ids.append(material.id)
 
         db.session.commit()
@@ -538,7 +485,10 @@ def download_materials_zip():
     if len(ids) > MAX_BATCH:
         return bad_request(f"Too many materials requested (max {MAX_BATCH})")
 
-    rows = Material.query.filter(Material.id.in_(ids)).all()
+    rows = Material.query.filter(
+        Material.user_id == current_user_id(),
+        Material.id.in_(ids)
+    ).all()
     if not rows:
         return not_found('Materials')
 
@@ -568,7 +518,7 @@ def download_materials_zip():
 @material_global_bp.route('/<material_id>/caption', methods=['GET'])
 def get_material_caption(material_id):
     """Get or generate caption for an existing material"""
-    material = Material.query.get(material_id)
+    material = Material.query.filter_by(id=material_id, user_id=current_user_id()).first()
     if not material:
         return not_found('Material')
 
@@ -596,7 +546,7 @@ def get_material_by_url():
     if not url:
         return bad_request('url parameter is required')
 
-    material = Material.query.filter_by(url=url).first()
+    material = Material.query.filter_by(url=url, user_id=current_user_id()).first()
     if not material:
         return not_found('Material')
 

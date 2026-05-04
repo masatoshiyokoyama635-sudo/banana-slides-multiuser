@@ -91,6 +91,7 @@ interface ProjectState {
 
   // Actions
   setCurrentProject: (project: Project | null) => void;
+  resetUserScopedState: () => void;
   setGlobalLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   
@@ -193,6 +194,17 @@ const debouncedUpdatePage = debounce(
 
   // Setters
   setCurrentProject: (project) => set({ currentProject: project }),
+  resetUserScopedState: () => set({
+    currentProject: null,
+    isGlobalLoading: false,
+    activeTaskId: null,
+    taskProgress: null,
+    error: null,
+    pageGeneratingTasks: {},
+    warningMessage: null,
+    isOutlineStreaming: false,
+    isDescriptionStreaming: false,
+  }),
   setGlobalLoading: (loading) => set({ isGlobalLoading: loading }),
   setError: (error) => set({ error }),
 

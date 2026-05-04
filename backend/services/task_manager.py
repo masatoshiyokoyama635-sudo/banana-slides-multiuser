@@ -6,13 +6,20 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, List, Dict, Any, Optional
 from datetime import datetime
-from sqlalchemy import func
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
 from PIL import Image
-from models import db, Task, Page, Material, PageImageVersion
+from sqlalchemy import func
+
+from models import Page, PageImageVersion, Project, Material, Task, db
+from services.pdf_service import split_pdf_to_pages
+from services.user_ai import create_user_ai_service, create_user_file_parser
 from utils import get_filtered_pages
 from utils.image_utils import check_image_resolution
+
+logger = logging.getLogger(__name__)
 
 
 def _get_image_prompt_field_names() -> set | None:
@@ -38,14 +45,27 @@ def _append_extra_fields(desc_text: str, desc_content: dict) -> str:
         if value and (allowed is None or name in allowed):
             parts.append(f"\n{name}：{value}")
     return ''.join(parts)
-from pathlib import Path
-from services.pdf_service import split_pdf_to_pages
 
-logger = logging.getLogger(__name__)
+
+def _get_task_project(project_id: str, user_id: str) -> Project | None:
+    if user_id is None:
+        return None
+    return Project.query.filter_by(id=project_id, user_id=user_id).first()
+
+
+def _get_task_page(project_id: str, page_id: str, user_id: str) -> Page | None:
+    if user_id is None:
+        return None
+    return Page.query.join(Project, Page.project_id == Project.id).filter(
+        Page.id == page_id,
+        Page.project_id == project_id,
+        Project.user_id == user_id,
+    ).first()
 
 
 class TaskManager:
     """Simple task manager using ThreadPoolExecutor"""
+
     
     def __init__(self, max_workers: int = 4):
         """Initialize task manager"""
@@ -188,34 +208,31 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
     """
     if app is None:
         raise ValueError("Flask app instance must be provided")
-    
-    # 在整个任务中保持应用上下文
+
     with app.app_context():
         try:
-            # 重要：在后台线程开始时就获取task和设置状态
             task = Task.query.get(task_id)
             if not task:
                 logger.error(f"Task {task_id} not found")
                 return
-            
+
+            task_user_id = task.user_id
             task.status = 'PROCESSING'
             db.session.commit()
             logger.info(f"Task {task_id} status updated to PROCESSING")
-            
-            # Flatten outline to get pages
-            pages_data = ai_service.flatten_outline(outline)
-            
-            # Get all pages for this project
-            pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
-            
+
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+
+            pages_data = user_ai_service.flatten_outline(outline)
+
+            pages = get_filtered_pages(project_id, user_id=task_user_id)
+
             if len(pages) != len(pages_data):
                 raise ValueError("Page count mismatch")
-            
-            # Mark all pages as GENERATING_DESCRIPTION before starting
+
             for page in pages:
                 page.status = 'GENERATING_DESCRIPTION'
 
-            # Initialize progress
             task.set_progress({
                 "total": len(pages),
                 "completed": 0,
@@ -223,59 +240,44 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
             })
             db.session.commit()
 
-            # Generate descriptions in parallel
             completed = 0
             failed = 0
-            
+
             def generate_single_desc(page_id, page_outline, page_index):
-                """
-                Generate description for a single page
-                注意：只传递 page_id（字符串），不传递 ORM 对象，避免跨线程会话问题
-                """
-                # 关键修复：在子线程中也需要应用上下文
                 with app.app_context():
                     try:
-                        # Get singleton AI service instance
-                        from services.ai_service_manager import get_ai_service
-                        ai_service = get_ai_service()
-                        
-                        desc_result = ai_service.generate_page_description(
+                        desc_result = user_ai_service.generate_page_description(
                             project_context, outline, page_outline, page_index,
                             language=language,
                             detail_level=detail_level
                         )
 
-                        # generate_page_description returns dict with text + optional extra_fields
                         desc_content = {
                             "text": desc_result['text'],
                             "generated_at": datetime.utcnow().isoformat()
                         }
                         if desc_result.get('extra_fields'):
                             desc_content['extra_fields'] = desc_result['extra_fields']
-                        
+
                         return (page_id, desc_content, None)
                     except Exception as e:
                         import traceback
                         error_detail = traceback.format_exc()
                         logger.error(f"Failed to generate description for page {page_id}: {error_detail}")
                         return (page_id, None, str(e))
-            
-            # Use ThreadPoolExecutor for parallel generation
-            # 关键：提前提取 page.id，不要传递 ORM 对象到子线程
+
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(generate_single_desc, page.id, page_data, i)
                     for i, (page, page_data) in enumerate(zip(pages, pages_data), 1)
                 ]
-                
-                # Process results as they complete
+
                 for future in as_completed(futures):
                     page_id, desc_content, error = future.result()
-                    
+
                     db.session.expire_all()
-                    
-                    # Update page in database
-                    page = Page.query.get(page_id)
+
+                    page = _get_task_page(project_id, page_id, task_user_id)
                     if page:
                         if error:
                             page.status = 'FAILED'
@@ -284,40 +286,36 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                             page.set_description_content(desc_content)
                             page.status = 'DESCRIPTION_GENERATED'
                             completed += 1
-                        
+
                         db.session.commit()
-                    
-                    # Update task progress
+
                     task = Task.query.get(task_id)
                     if task:
                         task.update_progress(completed=completed, failed=failed)
                         db.session.commit()
                         logger.info(f"Description Progress: {completed}/{len(pages)} pages completed")
-            
-            # Mark task as completed
+
             task = Task.query.get(task_id)
             if task:
                 task.status = 'COMPLETED'
                 task.completed_at = datetime.utcnow()
                 db.session.commit()
                 logger.info(f"Task {task_id} COMPLETED - {completed} pages generated, {failed} failed")
-            
-            # Update project status
-            from models import Project
-            project = Project.query.get(project_id)
+
+            project = _get_task_project(project_id, task_user_id) if task else None
             if project and failed == 0:
                 project.status = 'DESCRIPTIONS_GENERATED'
                 db.session.commit()
                 logger.info(f"Project {project_id} status updated to DESCRIPTIONS_GENERATED")
-        
+
         except Exception as e:
-            # Mark task as failed
             task = Task.query.get(task_id)
             if task:
                 task.status = 'FAILED'
                 task.error_message = str(e)
                 task.completed_at = datetime.utcnow()
                 db.session.commit()
+
 
 
 def generate_images_task(task_id: str, project_id: str, ai_service, file_service,
@@ -347,12 +345,14 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             if not task:
                 return
             
+            task_user_id = task.user_id
             task.status = 'PROCESSING'
             db.session.commit()
-            
+
             # Get pages for this project (filtered by page_ids if provided)
-            pages = get_filtered_pages(project_id, page_ids)
-            all_pages_data = ai_service.flatten_outline(outline)
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+            pages = get_filtered_pages(project_id, page_ids, user_id=task_user_id)
+            all_pages_data = user_ai_service.flatten_outline(outline)
 
             # Build mapping from order_index to page_data so filtered pages
             # get matched to the correct outline entry (not just first N)
@@ -384,7 +384,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                     try:
                         logger.debug(f"Starting image generation for page {page_id}, index {page_index}")
                         # Get page from database in this thread
-                        page_obj = Page.query.get(page_id)
+                        page_obj = _get_task_page(project_id, page_id, task_user_id)
                         if not page_obj:
                             raise ValueError(f"Page {page_id} not found")
                         
@@ -419,7 +419,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         
                         # 从描述文本中提取图片
                         if desc_text:
-                            image_urls = ai_service.extract_image_urls_from_markdown(desc_text)
+                            image_urls = user_ai_service.extract_image_urls_from_markdown(desc_text)
                             if image_urls:
                                 logger.info(f"Found {len(image_urls)} image(s) in page {page_id} description")
                                 page_additional_ref_images = image_urls
@@ -428,12 +428,12 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         # 在子线程中动态获取模板路径，确保使用最新模板
                         page_ref_image_path = None
                         if use_template:
-                            page_ref_image_path = file_service.get_template_path(project_id)
+                            page_ref_image_path = file_service.get_template_path(project_id, task_user_id)
                             # 注意：如果有风格描述，即使没有模板图片也允许生成
                             # 这个检查已经在 controller 层完成，这里不再检查
                         
                         # Generate image prompt
-                        prompt = ai_service.generate_image_prompt(
+                        prompt = user_ai_service.generate_image_prompt(
                             outline, page_data, desc_text, page_index,
                             has_material_images=has_material_images,
                             extra_requirements=extra_requirements,
@@ -442,10 +442,10 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                             aspect_ratio=aspect_ratio
                         )
                         logger.debug(f"Generated image prompt for page {page_id}")
-                        
+
                         # Generate image
                         logger.info(f"🎨 Calling AI service to generate image for page {page_index}/{len(pages)}...")
-                        image = ai_service.generate_image(
+                        image = user_ai_service.generate_image(
                             prompt, page_ref_image_path, aspect_ratio, resolution,
                             additional_ref_images=page_additional_ref_images if page_additional_ref_images else None
                         )
@@ -494,7 +494,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                     db.session.expire_all()
                     
                     # Update page in database (主要是为了更新失败状态)
-                    page = Page.query.get(page_id)
+                    page = _get_task_page(project_id, page_id, task_user_id)
                     if page:
                         if error:
                             page.status = 'FAILED'
@@ -531,7 +531,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             
             # Update project status
             from models import Project
-            project = Project.query.get(project_id)
+            project = _get_task_project(project_id, task_user_id) if task else None
             if project and failed == 0:
                 project.status = 'COMPLETED'
                 db.session.commit()
@@ -571,11 +571,14 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
             task.status = 'PROCESSING'
             db.session.commit()
             
+            task_user_id = task.user_id
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+
             # Get page from database
-            page = Page.query.get(page_id)
-            if not page or page.project_id != project_id:
+            page = _get_task_page(project_id, page_id, task_user_id)
+            if not page:
                 raise ValueError(f"Page {page_id} not found")
-            
+
             # Update page status
             page.status = 'GENERATING'
             db.session.commit()
@@ -602,7 +605,7 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
             has_material_images = False
             
             if desc_text:
-                image_urls = ai_service.extract_image_urls_from_markdown(desc_text)
+                image_urls = user_ai_service.extract_image_urls_from_markdown(desc_text)
                 if image_urls:
                     logger.info(f"Found {len(image_urls)} image(s) in page {page_id} description")
                     additional_ref_images = image_urls
@@ -611,7 +614,7 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
             # Get template path if use_template
             ref_image_path = None
             if use_template:
-                ref_image_path = file_service.get_template_path(project_id)
+                ref_image_path = file_service.get_template_path(project_id, task_user_id)
                 # 注意：如果有风格描述，即使没有模板图片也允许生成
                 # 这个检查已经在 controller 层完成，这里不再检查
             
@@ -620,7 +623,7 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
             if page.part:
                 page_data['part'] = page.part
             
-            prompt = ai_service.generate_image_prompt(
+            prompt = user_ai_service.generate_image_prompt(
                 outline, page_data, desc_text, page.order_index + 1,
                 has_material_images=has_material_images,
                 extra_requirements=extra_requirements,
@@ -628,10 +631,10 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
                 has_template=use_template,
                 aspect_ratio=aspect_ratio
             )
-            
+
             # Generate image
             logger.info(f"🎨 Generating image for page {page_id}...")
-            image = ai_service.generate_image(
+            image = user_ai_service.generate_image(
                 prompt, ref_image_path, aspect_ratio, resolution,
                 additional_ref_images=additional_ref_images if additional_ref_images else None
             )
@@ -670,7 +673,7 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
                 db.session.commit()
             
             # Update page status
-            page = Page.query.get(page_id)
+            page = _get_task_page(project_id, page_id, task_user_id) if task else None
             if page:
                 page.status = 'FAILED'
                 db.session.commit()
@@ -700,11 +703,14 @@ def edit_page_image_task(task_id: str, project_id: str, page_id: str,
             task.status = 'PROCESSING'
             db.session.commit()
             
+            task_user_id = task.user_id
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+
             # Get page from database
-            page = Page.query.get(page_id)
-            if not page or page.project_id != project_id:
+            page = _get_task_page(project_id, page_id, task_user_id)
+            if not page:
                 raise ValueError(f"Page {page_id} not found")
-            
+
             if not page.generated_image_path:
                 raise ValueError("Page must have generated image first")
             
@@ -718,7 +724,7 @@ def edit_page_image_task(task_id: str, project_id: str, page_id: str,
             # Edit image
             logger.info(f"🎨 Editing image for page {page_id}...")
             try:
-                image = ai_service.edit_image(
+                image = user_ai_service.edit_image(
                     edit_instruction,
                     current_image_path,
                     aspect_ratio,
@@ -777,7 +783,7 @@ def edit_page_image_task(task_id: str, project_id: str, page_id: str,
                 db.session.commit()
             
             # Update page status
-            page = Page.query.get(page_id)
+            page = _get_task_page(project_id, page_id, task_user_id) if task else None
             if page:
                 page.status = 'FAILED'
                 db.session.commit()
@@ -811,9 +817,12 @@ def generate_material_image_task(task_id: str, project_id: str, prompt: str,
             task.status = 'PROCESSING'
             db.session.commit()
             
+            task_user_id = task.user_id
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+
             # Generate image (复用核心逻辑)
             logger.info(f"🎨 Generating material image with prompt: {prompt[:100]}...")
-            image = ai_service.generate_image(
+            image = user_ai_service.generate_image(
                 prompt=prompt,
                 ref_image_path=ref_image_path,
                 aspect_ratio=aspect_ratio,
@@ -826,7 +835,9 @@ def generate_material_image_task(task_id: str, project_id: str, prompt: str,
             
             # 处理project_id：如果为'global'或None，转换为None
             actual_project_id = None if (project_id == 'global' or project_id is None) else project_id
-            
+            if actual_project_id is not None and not _get_task_project(actual_project_id, task_user_id):
+                raise ValueError(f"Project {actual_project_id} not found")
+
             # Save generated material image
             relative_path = file_service.save_material_image(image, actual_project_id)
             relative = Path(relative_path)
@@ -837,6 +848,7 @@ def generate_material_image_task(task_id: str, project_id: str, prompt: str,
             
             # Save material info to database
             material = Material(
+                user_id=task_user_id,
                 project_id=actual_project_id,
                 filename=filename,
                 relative_path=relative_path,
@@ -918,11 +930,14 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                 logger.error(f"Task {task_id} not found")
                 return
 
+            task_user_id = task.user_id
             task.status = 'PROCESSING'
             db.session.commit()
 
-            from models import Project
-            project = Project.query.get(project_id)
+            user_ai_service = ai_service or create_user_ai_service(task_user_id)
+            user_file_parser = file_parser_service or create_user_file_parser(task_user_id)
+
+            project = _get_task_project(project_id, task_user_id)
             if not project:
                 raise ValueError(f"Project {project_id} not found")
 
@@ -944,7 +959,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
             logger.info(f"Split PDF into {len(page_pdfs)} pages")
 
             # Get existing pages
-            pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+            pages = get_filtered_pages(project_id, user_id=task_user_id)
 
             # Ensure page count matches
             if len(pages) != len(page_pdfs):
@@ -977,14 +992,14 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                     try:
                         # Step A: Parse page PDF → markdown
                         filename = os.path.basename(page_pdf_path)
-                        _batch_id, md_text, extract_id, error_msg, _failed = file_parser_service.parse_file(page_pdf_path, filename)
+                        _batch_id, md_text, extract_id, error_msg, _failed = user_file_parser.parse_file(page_pdf_path, filename)
                         if error_msg:
                             logger.warning(f"Page {idx} parse warning: {error_msg}")
                         md_text = md_text or ''
 
                         # Supplement with header/footer from layout.json
                         if extract_id:
-                            hf_text = file_parser_service.extract_header_footer_from_layout(extract_id)
+                            hf_text = user_file_parser.extract_header_footer_from_layout(extract_id)
                             if hf_text:
                                 md_text = hf_text + '\n\n' + md_text
 
@@ -993,7 +1008,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                             error = 'empty_input'
                         else:
                             # Step B: AI extract structured content
-                            content = ai_service.extract_page_content(md_text, language=language)
+                            content = user_ai_service.extract_page_content(md_text, language=language)
                             error = None
 
                         # Step C: Optional layout caption
@@ -1007,7 +1022,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                                     elif page_obj.generated_image_path:
                                         image_path = file_service.get_absolute_path(page_obj.generated_image_path)
                                     if image_path and Path(image_path).exists():
-                                        caption = ai_service.generate_layout_caption(image_path)
+                                        caption = user_ai_service.generate_layout_caption(image_path)
                                         if caption:
                                             content['description'] += f"\n\n{caption}"
                             except Exception as e:
@@ -1015,7 +1030,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
 
                         # Step D: Write to DB immediately
                         content_results[idx] = content
-                        page_obj = Page.query.get(pages[idx].id)
+                        page_obj = _get_task_page(project_id, pages[idx].id, task_user_id)
                         if page_obj:
                             title = content.get('title', f'Page {idx + 1}')
                             points = content.get('points', [])
@@ -1071,7 +1086,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                 raise ValueError(f"{failed}/{page_count} 页内容提取失败: {reason}")
 
             # Update project-level aggregated text
-            project = Project.query.get(project_id)
+            project = _get_task_project(project_id, task_user_id) if task else None
             if project:
                 all_outlines = []
                 all_descriptions = []
@@ -1120,7 +1135,7 @@ def process_ppt_renovation_task(task_id: str, project_id: str, ai_service,
                 task.completed_at = datetime.utcnow()
 
             # Reset project status so user can retry
-            project = Project.query.get(project_id)
+            project = _get_task_project(project_id, task_user_id) if task else None
             if project:
                 project.status = 'DRAFT'
 
@@ -1177,8 +1192,15 @@ def export_editable_pptx_with_recursive_analysis_task(
         logger.info(f"开始递归分析导出任务 {task_id} for project {project_id}")
 
         try:
+            task = Task.query.get(task_id)
+            if not task:
+                logger.error(f"Task {task_id} not found")
+                return
+
+            task_user_id = task.user_id
+
             # Get project
-            project = Project.query.get(project_id)
+            project = _get_task_project(project_id, task_user_id)
             if not project:
                 raise ValueError(f'Project {project_id} not found')
 
@@ -1192,7 +1214,7 @@ def export_editable_pptx_with_recursive_analysis_task(
             db.session.expire_all()
 
             # Get pages (filtered by page_ids if provided)
-            pages = get_filtered_pages(project_id, page_ids)
+            pages = get_filtered_pages(project_id, page_ids, user_id=task_user_id)
             if not pages:
                 raise ValueError('No pages found for project')
             
@@ -1279,9 +1301,11 @@ def export_editable_pptx_with_recursive_analysis_task(
             logger.info(f"递归深度: {max_depth}, 并发数: {max_workers}")
             progress_callback("准备", f"幻灯片尺寸: {slide_width}×{slide_height}", 3)
             
+            user_ai_service = create_user_ai_service(task_user_id)
+
             # Step 2: 创建文字属性提取器
             from services.image_editability import TextAttributeExtractorFactory
-            text_attribute_extractor = TextAttributeExtractorFactory.create_caption_model_extractor()
+            text_attribute_extractor = TextAttributeExtractorFactory.create_caption_model_extractor(user_ai_service)
             progress_callback("准备", "文字属性提取器已初始化", 5)
             
             # Step 3: 调用导出方法（使用项目的导出设置）
@@ -1299,6 +1323,7 @@ def export_editable_pptx_with_recursive_analysis_task(
                 progress_callback=progress_callback,
                 export_extractor_method=export_extractor_method,
                 export_inpaint_method=export_inpaint_method,
+                ai_service=user_ai_service,
                 fail_fast=fail_fast
             )
             

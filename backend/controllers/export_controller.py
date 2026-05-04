@@ -3,24 +3,30 @@ Export Controller - handles file export endpoints
 """
 import logging
 import os
-import io
 import shutil
 import time
 import zipfile
 
 from flask import Blueprint, request, current_app
 from werkzeug.utils import secure_filename
-from models import db, Project, Page, Task
+from models import db, Task
 from utils import (
     error_response, not_found, bad_request, success_response,
     parse_page_ids_from_query, parse_page_ids_from_body, get_filtered_pages
 )
+from utils.auth import current_user_id, get_current_user_project
 from services import ExportService, FileService
-from services.ai_service_manager import get_ai_service
 
 logger = logging.getLogger(__name__)
 
 export_bp = Blueprint('export', __name__, url_prefix='/api/projects')
+
+
+def _get_user_project_or_404(project_id: str):
+    project = get_current_user_project(project_id)
+    if not project:
+        return None, not_found('Project')
+    return project, None
 
 
 @export_bp.route('/<project_id>/export/pptx', methods=['GET'])
@@ -43,16 +49,19 @@ def export_pptx(project_id):
         }
     """
     try:
-        project = Project.query.get(project_id)
-        
-        if not project:
-            return not_found('Project')
-        
+        project, error = _get_user_project_or_404(project_id)
+        if error:
+            return error
+
         # Get page_ids from query params and fetch filtered pages
         selected_page_ids = parse_page_ids_from_query(request)
         logger.debug(f"[export_pptx] selected_page_ids: {selected_page_ids}")
         
-        pages = get_filtered_pages(project_id, selected_page_ids if selected_page_ids else None)
+        pages = get_filtered_pages(
+            project_id,
+            selected_page_ids if selected_page_ids else None,
+            user_id=current_user_id(),
+        )
         logger.debug(f"[export_pptx] Exporting {len(pages)} pages")
         
         if not pages:
@@ -120,14 +129,17 @@ def export_pdf(project_id):
         }
     """
     try:
-        project = Project.query.get(project_id)
-        
-        if not project:
-            return not_found('Project')
-        
+        project, error = _get_user_project_or_404(project_id)
+        if error:
+            return error
+
         # Get page_ids from query params and fetch filtered pages
         selected_page_ids = parse_page_ids_from_query(request)
-        pages = get_filtered_pages(project_id, selected_page_ids if selected_page_ids else None)
+        pages = get_filtered_pages(
+            project_id,
+            selected_page_ids if selected_page_ids else None,
+            user_id=current_user_id(),
+        )
         
         if not pages:
             return bad_request("No pages found for project")
@@ -189,12 +201,16 @@ def export_images(project_id):
         if s_project_id != project_id:
             return bad_request('Invalid project ID')
 
-        project = Project.query.get(s_project_id)
-        if not project:
-            return not_found('Project')
+        project, error = _get_user_project_or_404(s_project_id)
+        if error:
+            return error
 
         selected_page_ids = parse_page_ids_from_query(request)
-        pages = get_filtered_pages(s_project_id, selected_page_ids if selected_page_ids else None)
+        pages = get_filtered_pages(
+            s_project_id,
+            selected_page_ids if selected_page_ids else None,
+            user_id=current_user_id(),
+        )
         if not pages:
             return bad_request("No pages found for project")
 
@@ -280,17 +296,20 @@ def export_editable_pptx(project_id):
     轮询 /api/projects/{project_id}/tasks/{task_id} 获取进度和下载链接
     """
     try:
-        project = Project.query.get(project_id)
-        
-        if not project:
-            return not_found('Project')
-        
+        project, error = _get_user_project_or_404(project_id)
+        if error:
+            return error
+
         # Get parameters from request body
         data = request.get_json() or {}
         
         # Get page_ids from request body and fetch filtered pages
         selected_page_ids = parse_page_ids_from_body(data)
-        pages = get_filtered_pages(project_id, selected_page_ids if selected_page_ids else None)
+        pages = get_filtered_pages(
+            project_id,
+            selected_page_ids if selected_page_ids else None,
+            user_id=current_user_id(),
+        )
         
         if not pages:
             return bad_request("No pages found for project")
@@ -321,6 +340,7 @@ def export_editable_pptx(project_id):
         
         # Create task record
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='EXPORT_EDITABLE_PPTX',
             status='PENDING'

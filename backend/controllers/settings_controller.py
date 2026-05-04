@@ -10,22 +10,42 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from flask import Blueprint, request, current_app
 from PIL import Image
-from models import db, Settings, Task
+from models import db, Settings, Task, UserSettings
+from services.user_ai import create_user_ai_service, create_user_file_parser
 from utils import success_response, error_response, bad_request
+from utils.auth import current_user_id
 from config import Config, PROJECT_ROOT
-from services.ai_service import AIService
 from services.file_parser_service import FileParserService
 from services.ai_providers.ocr.baidu_accurate_ocr_provider import create_baidu_accurate_ocr_provider
 from services.ai_providers.image.baidu_inpainting_provider import create_baidu_inpainting_provider
-from services.ai_providers import LAZYLLM_VENDORS
 from services.task_manager import task_manager
 
 logger = logging.getLogger(__name__)
-ALLOWED_PROVIDER_FORMATS = {"openai", "gemini", "lazyllm"} | LAZYLLM_VENDORS
+ALLOWED_TEST_NAMES = {"text-model", "caption-model", "image-model"}
 
 settings_bp = Blueprint(
     "settings", __name__, url_prefix="/api/settings"
 )
+
+USER_SETTING_FIELDS = frozenset({
+    "api_key",
+    "output_language",
+})
+
+
+def _apply_user_settings(settings: UserSettings, data: dict):
+    if "api_key" in data:
+        api_key = data["api_key"]
+        settings.api_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+
+    if "output_language" in data:
+        output_language = (data["output_language"] or "").strip() or None
+        if output_language not in (None, "zh", "en", "ja", "auto"):
+            return bad_request("Output language must be 'zh', 'en', 'ja', or 'auto'")
+        settings.output_language = output_language
+
+    settings.updated_at = datetime.now(timezone.utc)
+    return None
 
 
 @contextmanager
@@ -46,95 +66,42 @@ def temporary_settings_override(settings_override: dict):
     """
     original_values = {}
 
+    SYSTEM_TEST_OVERRIDE_FIELDS = (
+        "mineru_api_base",
+        "mineru_token",
+        "baidu_api_key",
+        "image_resolution",
+        "enable_text_reasoning",
+        "text_thinking_budget",
+        "enable_image_reasoning",
+        "image_thinking_budget",
+    )
+
     try:
-        # 应用覆盖设置
-        if settings_override.get("api_key"):
-            original_values["GOOGLE_API_KEY"] = current_app.config.get("GOOGLE_API_KEY")
-            original_values["OPENAI_API_KEY"] = current_app.config.get("OPENAI_API_KEY")
-            current_app.config["GOOGLE_API_KEY"] = settings_override["api_key"]
-            current_app.config["OPENAI_API_KEY"] = settings_override["api_key"]
-
-        if settings_override.get("api_base_url"):
-            original_values["GOOGLE_API_BASE"] = current_app.config.get("GOOGLE_API_BASE")
-            original_values["OPENAI_API_BASE"] = current_app.config.get("OPENAI_API_BASE")
-            current_app.config["GOOGLE_API_BASE"] = settings_override["api_base_url"]
-            current_app.config["OPENAI_API_BASE"] = settings_override["api_base_url"]
-
-        if settings_override.get("ai_provider_format"):
-            original_values["AI_PROVIDER_FORMAT"] = current_app.config.get("AI_PROVIDER_FORMAT")
-            current_app.config["AI_PROVIDER_FORMAT"] = settings_override["ai_provider_format"]
-
-        if settings_override.get("text_model"):
-            original_values["TEXT_MODEL"] = current_app.config.get("TEXT_MODEL")
-            current_app.config["TEXT_MODEL"] = settings_override["text_model"]
-
-        if settings_override.get("image_model"):
-            original_values["IMAGE_MODEL"] = current_app.config.get("IMAGE_MODEL")
-            current_app.config["IMAGE_MODEL"] = settings_override["image_model"]
-
-        if settings_override.get("image_caption_model"):
-            original_values["IMAGE_CAPTION_MODEL"] = current_app.config.get("IMAGE_CAPTION_MODEL")
-            current_app.config["IMAGE_CAPTION_MODEL"] = settings_override["image_caption_model"]
-
-        # Per-model source overrides (empty string = clear, to fall back to global config)
-        for source_field, config_key in [
-            ("text_model_source", "TEXT_MODEL_SOURCE"),
-            ("image_model_source", "IMAGE_MODEL_SOURCE"),
-            ("image_caption_model_source", "IMAGE_CAPTION_MODEL_SOURCE"),
-        ]:
-            if source_field in settings_override:
-                original_values[config_key] = current_app.config.get(config_key)
-                val = settings_override[source_field]
-                if val:
-                    current_app.config[config_key] = val
-                else:
-                    current_app.config.pop(config_key, None)
-
-        # Per-model API credentials override
-        for model_type in ('text', 'image', 'image_caption'):
-            prefix = model_type.upper()
-            key_field = f'{model_type}_api_key'
-            base_field = f'{model_type}_api_base_url'
-            if settings_override.get(key_field):
-                config_key = f'{prefix}_API_KEY'
-                original_values[config_key] = current_app.config.get(config_key)
-                current_app.config[config_key] = settings_override[key_field]
-            if settings_override.get(base_field):
-                config_key = f'{prefix}_API_BASE'
-                original_values[config_key] = current_app.config.get(config_key)
-                current_app.config[config_key] = settings_override[base_field]
-
-        if settings_override.get("mineru_api_base"):
-            original_values["MINERU_API_BASE"] = current_app.config.get("MINERU_API_BASE")
-            current_app.config["MINERU_API_BASE"] = settings_override["mineru_api_base"]
-
-        if settings_override.get("mineru_token"):
-            original_values["MINERU_TOKEN"] = current_app.config.get("MINERU_TOKEN")
-            current_app.config["MINERU_TOKEN"] = settings_override["mineru_token"]
-
-        if settings_override.get("baidu_api_key"):
-            original_values["BAIDU_API_KEY"] = current_app.config.get("BAIDU_API_KEY")
-            current_app.config["BAIDU_API_KEY"] = settings_override["baidu_api_key"]
-
-        if settings_override.get("image_resolution"):
-            original_values["DEFAULT_RESOLUTION"] = current_app.config.get("DEFAULT_RESOLUTION")
-            current_app.config["DEFAULT_RESOLUTION"] = settings_override["image_resolution"]
-
-        if "enable_text_reasoning" in settings_override:
-            original_values["ENABLE_TEXT_REASONING"] = current_app.config.get("ENABLE_TEXT_REASONING")
-            current_app.config["ENABLE_TEXT_REASONING"] = settings_override["enable_text_reasoning"]
-
-        if "text_thinking_budget" in settings_override:
-            original_values["TEXT_THINKING_BUDGET"] = current_app.config.get("TEXT_THINKING_BUDGET")
-            current_app.config["TEXT_THINKING_BUDGET"] = settings_override["text_thinking_budget"]
-
-        if "enable_image_reasoning" in settings_override:
-            original_values["ENABLE_IMAGE_REASONING"] = current_app.config.get("ENABLE_IMAGE_REASONING")
-            current_app.config["ENABLE_IMAGE_REASONING"] = settings_override["enable_image_reasoning"]
-
-        if "image_thinking_budget" in settings_override:
-            original_values["IMAGE_THINKING_BUDGET"] = current_app.config.get("IMAGE_THINKING_BUDGET")
-            current_app.config["IMAGE_THINKING_BUDGET"] = settings_override["image_thinking_budget"]
+        for field in SYSTEM_TEST_OVERRIDE_FIELDS:
+            if field not in settings_override:
+                continue
+            value = settings_override[field]
+            if field == "mineru_api_base" and value:
+                config_key = "MINERU_API_BASE"
+            elif field == "mineru_token" and value:
+                config_key = "MINERU_TOKEN"
+            elif field == "baidu_api_key" and value:
+                config_key = "BAIDU_API_KEY"
+            elif field == "image_resolution" and value:
+                config_key = "DEFAULT_RESOLUTION"
+            elif field == "enable_text_reasoning":
+                config_key = "ENABLE_TEXT_REASONING"
+            elif field == "text_thinking_budget":
+                config_key = "TEXT_THINKING_BUDGET"
+            elif field == "enable_image_reasoning":
+                config_key = "ENABLE_IMAGE_REASONING"
+            elif field == "image_thinking_budget":
+                config_key = "IMAGE_THINKING_BUDGET"
+            else:
+                continue
+            original_values[config_key] = current_app.config.get(config_key)
+            current_app.config[config_key] = value
 
         yield
 
@@ -150,10 +117,10 @@ def temporary_settings_override(settings_override: dict):
 @settings_bp.route("/", methods=["GET"], strict_slashes=False)
 def get_settings():
     """
-    GET /api/settings - Get application settings
+    GET /api/settings - Get current user's AI settings
     """
     try:
-        settings = Settings.get_settings()
+        settings = UserSettings.get_for_user(current_user_id())
         return success_response(settings.to_dict())
     except Exception as e:
         logger.error(f"Error getting settings: {str(e)}")
@@ -167,186 +134,21 @@ def get_settings():
 @settings_bp.route("/", methods=["PUT"], strict_slashes=False)
 def update_settings():
     """
-    PUT /api/settings - Update application settings
-
-    Request Body:
-        {
-            "api_base_url": "https://api.example.com",
-            "api_key": "your-api-key",
-            "image_resolution": "2K",
-            "image_aspect_ratio": "16:9"
-        }
+    PUT /api/settings - Update current user's AI settings.
     """
     try:
         data = request.get_json()
         if not data:
             return bad_request("Request body is required")
 
-        settings = Settings.get_settings()
+        settings = UserSettings.get_for_user(current_user_id())
+        error = _apply_user_settings(settings, data)
+        if error:
+            return error
 
-        # Update AI provider format configuration
-        if "ai_provider_format" in data:
-            provider_format = data["ai_provider_format"]
-            if provider_format not in ALLOWED_PROVIDER_FORMATS:
-                allowed_values = "', '".join(sorted(ALLOWED_PROVIDER_FORMATS))
-                return bad_request(f"AI provider format must be one of '{allowed_values}'")
-            settings.ai_provider_format = provider_format
-
-        # Update API configuration
-        if "api_base_url" in data:
-            raw_base_url = data["api_base_url"]
-            # Empty string from frontend means "clear override, fall back to env/default"
-            if raw_base_url is None:
-                settings.api_base_url = None
-            else:
-                value = str(raw_base_url).strip()
-                settings.api_base_url = value if value != "" else None
-
-        if "api_key" in data:
-            settings.api_key = data["api_key"]
-
-        # Update image generation configuration
-        if "image_resolution" in data:
-            resolution = data["image_resolution"]
-            if resolution not in ["1K", "2K", "4K"]:
-                return bad_request("Resolution must be 1K, 2K, or 4K")
-            settings.image_resolution = resolution
-
-        if "image_aspect_ratio" in data:
-            aspect_ratio = data["image_aspect_ratio"]
-            settings.image_aspect_ratio = aspect_ratio
-
-        # Update worker configuration
-        if "max_description_workers" in data:
-            workers = int(data["max_description_workers"])
-            if workers < 1 or workers > 20:
-                return bad_request(
-                    "Max description workers must be between 1 and 20"
-                )
-            settings.max_description_workers = workers
-
-        if "max_image_workers" in data:
-            workers = int(data["max_image_workers"])
-            if workers < 1 or workers > 20:
-                return bad_request(
-                    "Max image workers must be between 1 and 20"
-                )
-            settings.max_image_workers = workers
-
-        # Update model & MinerU configuration (optional, empty values fall back to Config)
-        if "text_model" in data:
-            settings.text_model = (data["text_model"] or "").strip() or None
-
-        if "image_model" in data:
-            settings.image_model = (data["image_model"] or "").strip() or None
-
-        if "mineru_api_base" in data:
-            settings.mineru_api_base = (data["mineru_api_base"] or "").strip() or None
-
-        if "mineru_token" in data:
-            settings.mineru_token = data["mineru_token"]
-
-        if "image_caption_model" in data:
-            settings.image_caption_model = (data["image_caption_model"] or "").strip() or None
-
-        if "output_language" in data:
-            language = data["output_language"]
-            if language in ["zh", "en", "ja", "auto"]:
-                settings.output_language = language
-            else:
-                return bad_request("Output language must be 'zh', 'en', 'ja', or 'auto'")
-
-        # Update description generation mode
-        if "description_generation_mode" in data:
-            mode = data["description_generation_mode"]
-            if mode not in ("streaming", "parallel"):
-                return bad_request("description_generation_mode must be 'streaming' or 'parallel'")
-            settings.description_generation_mode = mode
-
-        # Update description extra fields
-        if "description_extra_fields" in data:
-            fields = data["description_extra_fields"]
-            if not isinstance(fields, list) or not fields:
-                return bad_request("description_extra_fields must be a non-empty array of strings")
-            if len(fields) > 10:
-                return bad_request("description_extra_fields allows at most 10 items")
-            if not all(isinstance(f, str) and f.strip() for f in fields):
-                return bad_request("Each extra field must be a non-empty string")
-            settings.description_extra_fields = json.dumps([f.strip() for f in fields], ensure_ascii=False)
-
-        if "image_prompt_extra_fields" in data:
-            fields = data["image_prompt_extra_fields"]
-            if not isinstance(fields, list):
-                return bad_request("image_prompt_extra_fields must be an array of strings")
-            # 空数组表示不传任何额外字段给图片生成
-            settings.image_prompt_extra_fields = json.dumps([f.strip() for f in fields if isinstance(f, str) and f.strip()], ensure_ascii=False)
-
-        # Update reasoning mode configuration (separate for text and image)
-        if "enable_text_reasoning" in data:
-            settings.enable_text_reasoning = bool(data["enable_text_reasoning"])
-        
-        if "text_thinking_budget" in data:
-            budget = int(data["text_thinking_budget"])
-            if budget < 1 or budget > 8192:
-                return bad_request("Text thinking budget must be between 1 and 8192")
-            settings.text_thinking_budget = budget
-        
-        if "enable_image_reasoning" in data:
-            settings.enable_image_reasoning = bool(data["enable_image_reasoning"])
-        
-        if "image_thinking_budget" in data:
-            budget = int(data["image_thinking_budget"])
-            if budget < 1 or budget > 8192:
-                return bad_request("Image thinking budget must be between 1 and 8192")
-            settings.image_thinking_budget = budget
-
-        # Update Baidu OCR configuration
-        if "baidu_api_key" in data:
-            settings.baidu_api_key = data["baidu_api_key"] or None
-
-        # Update per-model provider source configuration
-        if "text_model_source" in data:
-            settings.text_model_source = (data["text_model_source"] or "").strip() or None
-
-        if "image_model_source" in data:
-            settings.image_model_source = (data["image_model_source"] or "").strip() or None
-
-        if "image_caption_model_source" in data:
-            settings.image_caption_model_source = (data["image_caption_model_source"] or "").strip() or None
-
-        # Update per-model API credentials (for gemini/openai per-model overrides)
-        for model_type in ('text', 'image', 'image_caption'):
-            key_field = f'{model_type}_api_key'
-            base_field = f'{model_type}_api_base_url'
-
-            if key_field in data:
-                setattr(settings, key_field, data[key_field] or None)
-
-            if base_field in data:
-                setattr(settings, base_field, (data[base_field] or "").strip() or None)
-
-        if "lazyllm_api_keys" in data:
-            keys_data = data["lazyllm_api_keys"]
-            if isinstance(keys_data, dict):
-                # Merge with existing keys (only update non-empty values)
-                existing = settings.get_lazyllm_api_keys_dict()
-                for vendor, key in keys_data.items():
-                    if key:  # Only update if a new value is provided
-                        existing[vendor] = key
-                settings.lazyllm_api_keys = json.dumps(existing) if existing else None
-            elif keys_data is None:
-                settings.lazyllm_api_keys = None
-
-        settings.updated_at = datetime.now(timezone.utc)
         db.session.commit()
-
-        # Sync to app.config
-        _sync_settings_to_config(settings)
-
-        logger.info("Settings updated successfully")
-        return success_response(
-            settings.to_dict(), "Settings updated successfully"
-        )
+        logger.info("User settings updated successfully")
+        return success_response(settings.to_dict(), "Settings updated successfully")
 
     except Exception as e:
         db.session.rollback()
@@ -361,51 +163,17 @@ def update_settings():
 @settings_bp.route("/reset", methods=["POST"], strict_slashes=False)
 def reset_settings():
     """
-    POST /api/settings/reset - Reset settings to default values
+    POST /api/settings/reset - Reset current user's AI settings to defaults.
     """
     try:
-        settings = Settings.get_settings()
-
-        # Reset all fields to NULL so .env defaults take over via to_dict()
-        settings.ai_provider_format = None
-        settings.api_base_url = None
+        settings = UserSettings.get_for_user(current_user_id())
         settings.api_key = None
-        settings.text_model = None
-        settings.image_model = None
-        settings.mineru_api_base = None
-        settings.mineru_token = None
-        settings.image_caption_model = None
         settings.output_language = None
-        settings.enable_text_reasoning = False
-        settings.text_thinking_budget = 1024
-        settings.enable_image_reasoning = False
-        settings.image_thinking_budget = 1024
-        settings.description_generation_mode = None
-        settings.description_extra_fields = None
-        settings.image_prompt_extra_fields = None
-        settings.baidu_api_key = None
-        settings.text_model_source = None
-        settings.image_model_source = None
-        settings.image_caption_model_source = None
-        settings.lazyllm_api_keys = None
-        for model_type in ('text', 'image', 'image_caption'):
-            setattr(settings, f'{model_type}_api_key', None)
-            setattr(settings, f'{model_type}_api_base_url', None)
-        settings.image_resolution = None
-        settings.image_aspect_ratio = None
-        settings.max_description_workers = None
-        settings.max_image_workers = None
         settings.updated_at = datetime.now(timezone.utc)
-
         db.session.commit()
 
-        # Sync to app.config
-        _sync_settings_to_config(settings)
-
-        logger.info("Settings reset to defaults")
-        return success_response(
-            settings.to_dict(), "Settings reset to defaults"
-        )
+        logger.info("User settings reset to defaults")
+        return success_response(settings.to_dict(), "Settings reset to defaults")
 
     except Exception as e:
         db.session.rollback()
@@ -417,113 +185,46 @@ def reset_settings():
         )
 
 
-@settings_bp.route("/active-config", methods=["GET"], strict_slashes=False)
-def get_active_config():
-    """
-    GET /api/settings/active-config - Return current app.config values for AI settings.
-    Useful for verifying that _sync_settings_to_config correctly restored .env defaults.
-    """
-    return success_response({
-        "ai_provider_format": current_app.config.get("AI_PROVIDER_FORMAT"),
-        "text_model": current_app.config.get("TEXT_MODEL"),
-        "image_model": current_app.config.get("IMAGE_MODEL"),
-        "output_language": current_app.config.get("OUTPUT_LANGUAGE"),
-        "image_caption_model": current_app.config.get("IMAGE_CAPTION_MODEL"),
-    })
-
 
 @settings_bp.route("/verify", methods=["POST"], strict_slashes=False)
 def verify_api_key():
     """
-    POST /api/settings/verify - 验证模型配置是否可用
-    通过调用一个轻量测试请求（thinking_budget=0）来判断
-
-    Returns:
-        {
-            "data": {
-                "available": true/false,
-                "message": "提示信息"
-            }
-        }
+    POST /api/settings/verify - Verify the current user's text model config.
     """
     try:
-        # 获取当前设置
-        settings = Settings.get_settings()
-        if not settings:
+        try:
+            service = create_user_ai_service(current_user_id())
+            service.text_provider.generate_text("Hello", thinking_budget=0)
+            logger.info("API key verification successful")
+            return success_response({
+                "available": True,
+                "message": "API key 可用"
+            })
+        except ValueError as ve:
+            logger.warning(f"API key not configured: {str(ve)}")
             return success_response({
                 "available": False,
-                "message": "用户设置未找到"
+                "message": "API key 未配置，请在设置中配置 API key"
             })
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"API key verification failed: {error_msg}")
 
-        # 准备设置覆盖字典
-        settings_override = {}
-        if settings.api_key:
-            settings_override["api_key"] = settings.api_key
-        if settings.api_base_url:
-            settings_override["api_base_url"] = settings.api_base_url
-        if settings.ai_provider_format:
-            settings_override["ai_provider_format"] = settings.ai_provider_format
-        if settings.text_model:
-            settings_override["text_model"] = settings.text_model
+            if "401" in error_msg or "unauthorized" in error_msg.lower() or "invalid" in error_msg.lower():
+                message = "API key 无效或已过期，请在设置中检查 API key 配置"
+            elif "429" in error_msg or "quota" in error_msg.lower() or "limit" in error_msg.lower():
+                message = "API 调用超限或余额不足，请在设置中检查配置"
+            elif "403" in error_msg or "forbidden" in error_msg.lower():
+                message = "API 访问被拒绝，请在设置中检查 API key 权限"
+            elif "timeout" in error_msg.lower():
+                message = "API 调用超时，请稍后重试或检查中转站连接"
+            else:
+                message = f"API 调用失败，请在设置中检查配置: {error_msg}"
 
-        # 使用上下文管理器临时应用用户配置进行验证
-        with temporary_settings_override(settings_override):
-            from services.ai_providers import get_text_provider
-
-            verification_model = (
-                settings.text_model
-                or current_app.config.get("TEXT_MODEL")
-                or Config.TEXT_MODEL
-                or "gemini-3-flash-preview"
-            )
-
-            # 尝试创建provider并调用一个简单的测试请求
-            try:
-                provider = get_text_provider(model=verification_model)
-                # 调用一个简单的测试请求（思考budget=0，最小开销）
-                provider.generate_text("Hello", thinking_budget=0)
-
-                logger.info("API key verification successful")
-                return success_response({
-                    "available": True,
-                    "message": "API key 可用"
-                })
-
-            except ValueError as ve:
-                # API key未配置
-                logger.warning(f"API key not configured: {str(ve)}")
-                provider_format = (settings.ai_provider_format or "").lower()
-                if provider_format == "lazyllm" or provider_format in LAZYLLM_VENDORS:
-                    source = (provider_format if provider_format in LAZYLLM_VENDORS
-                              else current_app.config.get("TEXT_MODEL_SOURCE") or Config.TEXT_MODEL_SOURCE or "unknown").upper()
-                    message = f"LazyLLM API key 未配置，请设置 {source}_API_KEY"
-                else:
-                    message = "API key 未配置，请在设置中配置 API key 和 API Base URL"
-                return success_response({
-                    "available": False,
-                    "message": message
-                })
-            except Exception as e:
-                # API调用失败（可能是key无效、余额不足等）
-                error_msg = str(e)
-                logger.warning(f"API key verification failed: {error_msg}")
-
-                # 根据错误信息判断具体原因
-                if "401" in error_msg or "unauthorized" in error_msg.lower() or "invalid" in error_msg.lower():
-                    message = "API key 无效或已过期，请在设置中检查 API key 配置"
-                elif "429" in error_msg or "quota" in error_msg.lower() or "limit" in error_msg.lower():
-                    message = "API 调用超限或余额不足，请在设置中检查配置"
-                elif "403" in error_msg or "forbidden" in error_msg.lower():
-                    message = "API 访问被拒绝，请在设置中检查 API key 权限"
-                elif "timeout" in error_msg.lower():
-                    message = "API 调用超时，请在设置中检查网络连接和 API Base URL"
-                else:
-                    message = f"API 调用失败，请在设置中检查配置: {error_msg}"
-
-                return success_response({
-                    "available": False,
-                    "message": message
-                })
+            return success_response({
+                "available": False,
+                "message": message
+            })
 
     except Exception as e:
         logger.error(f"Error verifying API key: {str(e)}")
@@ -775,14 +476,14 @@ def _test_baidu_ocr():
     }, "百度 OCR 测试成功"
 
 
-def _test_text_model():
+def _test_text_model(user_id: str, test_settings: dict | None = None):
     """测试文本生成模型"""
-    ai_service = AIService()
+    ai_service = create_user_ai_service(user_id, test_settings)
     reply = ai_service.text_provider.generate_text("请只回复 OK。", thinking_budget=64)
     return {"reply": reply.strip()}, "文本模型测试成功"
 
 
-def _test_caption_model():
+def _test_caption_model(user_id: str, test_settings: dict | None = None):
     """测试图片识别模型"""
     upload_folder = Path(current_app.config.get("UPLOAD_FOLDER", Config.UPLOAD_FOLDER))
     mineru_root = upload_folder / "mineru_files"
@@ -796,7 +497,7 @@ def _test_caption_model():
         test_image_path = _get_test_image_path()
         shutil.copyfile(test_image_path, image_path)
 
-        parser = _create_file_parser()
+        parser = create_user_file_parser(user_id, test_settings)
         image_url = f"/files/mineru/{extract_id}/{image_path.name}"
         caption = parser._generate_single_caption(image_url).strip()
 
@@ -842,9 +543,9 @@ def _test_baidu_inpaint():
     return {"image_size": result.size}, "百度图像修复测试成功"
 
 
-def _test_image_model():
+def _test_image_model(user_id: str, test_settings: dict | None = None):
     """测试图像生成模型"""
-    ai_service = AIService()
+    ai_service = create_user_ai_service(user_id, test_settings)
     test_image_path = _get_test_image_path()
     prompt = "生成一张简洁、明亮、适合演示文稿的背景图。"
     settings = Settings.get_settings()
@@ -947,7 +648,11 @@ def _run_test_async(task_id: str, test_name: str, test_settings: dict, app):
                 if not test_func:
                     raise ValueError(f"未知测试类型: {test_name}")
 
-                result_data, message = test_func()
+                user_id = task.user_id
+                if test_name in {"text-model", "caption-model", "image-model"}:
+                    result_data, message = test_func(user_id, test_settings)
+                else:
+                    result_data, message = test_func()
 
                 # 更新任务状态为完成
                 task = Task.query.get(task_id)
@@ -982,9 +687,6 @@ def run_settings_test(test_name: str):
         可选的设置覆盖参数，用于测试未保存的配置
         {
             "api_key": "test-key",
-            "api_base_url": "https://test.api.com",
-            "text_model": "test-model",
-            ...
         }
 
     Returns:
@@ -996,32 +698,17 @@ def run_settings_test(test_name: str):
         }
     """
     try:
-        # 从数据库加载已保存的全局设置作为基础
-        global_settings = Settings.get_settings()
+        if test_name not in ALLOWED_TEST_NAMES:
+            return error_response("TEST_NOT_ALLOWED", "该服务测试不可由普通用户触发", 404)
 
-        # 构建基础测试设置（使用数据库中已保存的值）
+        user_settings = UserSettings.get_for_user(current_user_id())
         test_settings = {}
-        if global_settings.api_key:
-            test_settings["api_key"] = global_settings.api_key
-        if global_settings.api_base_url:
-            test_settings["api_base_url"] = global_settings.api_base_url
-        if global_settings.ai_provider_format:
-            test_settings["ai_provider_format"] = global_settings.ai_provider_format
-        if global_settings.text_model:
-            test_settings["text_model"] = global_settings.text_model
-        if global_settings.image_model:
-            test_settings["image_model"] = global_settings.image_model
-        if global_settings.image_caption_model:
-            test_settings["image_caption_model"] = global_settings.image_caption_model
-        if current_app.config.get("IMAGE_CAPTION_MODEL_SOURCE"):
-            test_settings["image_caption_model_source"] = current_app.config.get("IMAGE_CAPTION_MODEL_SOURCE")
-        # Per-model provider sources and credentials
-        for model_type in ('text', 'image', 'image_caption'):
-            for suffix in ('model_source', 'api_key', 'api_base_url'):
-                attr = f'{model_type}_{suffix}'
-                val = getattr(global_settings, attr, None)
-                if val:
-                    test_settings[attr] = val
+        for field in USER_SETTING_FIELDS:
+            value = getattr(user_settings, field, None)
+            if value is not None:
+                test_settings[field] = value
+
+        global_settings = Settings.get_settings()
         if global_settings.mineru_api_base:
             test_settings["mineru_api_base"] = global_settings.mineru_api_base
         if global_settings.mineru_token:
@@ -1039,12 +726,14 @@ def run_settings_test(test_name: str):
         # 应用前端发送的覆盖参数（如果有的话，用于测试未保存的配置）
         override_settings = request.get_json() or {}
         if override_settings:
-            logger.info(f"Applying test setting overrides: {list(override_settings.keys())}")
-            test_settings.update(override_settings)
+            allowed_overrides = {key: value for key, value in override_settings.items() if key in USER_SETTING_FIELDS}
+            logger.info(f"Applying test setting overrides: {list(allowed_overrides.keys())}")
+            test_settings.update(allowed_overrides)
 
         # 创建任务记录（使用特殊的 project_id='settings-test'）
         task = Task(
-            project_id='settings-test',  # 特殊标记，表示这是设置测试任务
+            user_id=current_user_id(),
+            project_id=None,
             task_type=f'TEST_{test_name.upper().replace("-", "_")}',
             status='PENDING'
         )
@@ -1094,7 +783,7 @@ def get_test_status(task_id: str):
         }
     """
     try:
-        task = Task.query.get(task_id)
+        task = Task.query.filter_by(id=task_id, user_id=current_user_id()).first()
         if not task:
             return error_response("TASK_NOT_FOUND", "测试任务不存在", 404)
 

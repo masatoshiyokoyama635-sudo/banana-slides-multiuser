@@ -22,10 +22,39 @@ from flask import Flask
 from flask_cors import CORS
 from models import db
 from config import Config
+from controllers.auth_controller import auth_bp
 from controllers.material_controller import material_bp, material_global_bp
 from controllers.reference_file_controller import reference_file_bp
 from controllers.settings_controller import settings_bp
 from controllers import project_bp, page_bp, template_bp, user_template_bp, export_bp, file_bp, style_bp
+
+
+DEFAULT_SECRET_KEYS = {'', 'your-secret-key-change-this'}
+
+
+def _parse_cors_origins():
+    raw_cors = os.getenv('CORS_ORIGINS', 'http://localhost:3000')
+    if raw_cors.strip() == '*':
+        raise RuntimeError('CORS_ORIGINS=* is not allowed with credentialed session authentication')
+    return [origin.strip() for origin in raw_cors.split(',') if origin.strip()]
+
+
+def _safe_database_label(database_uri):
+    if database_uri.startswith('sqlite:///'):
+        return 'sqlite:///[local-file]'
+    if database_uri.startswith('sqlite://'):
+        return 'sqlite://[memory]'
+    return database_uri.split('://', 1)[0] + '://[redacted]'
+
+
+def _validate_secret_key(app):
+    secret_key = os.getenv('SECRET_KEY', app.config.get('SECRET_KEY', ''))
+    app.config['SECRET_KEY'] = secret_key
+    runtime_env = os.getenv('FLASK_ENV', 'development')
+    if runtime_env in {'development', 'testing', 'test'}:
+        return
+    if secret_key in DEFAULT_SECRET_KEYS or len(secret_key) < 32:
+        raise RuntimeError('SECRET_KEY must be set to a non-default value of at least 32 characters')
 
 
 # Enable SQLite WAL mode for all connections
@@ -55,6 +84,7 @@ def create_app():
     
     # Load configuration from Config class
     app.config.from_object(Config)
+    _validate_secret_key(app)
     
     # Override with environment-specific paths (use absolute path)
     backend_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +92,8 @@ def create_app():
     os.makedirs(instance_dir, exist_ok=True)
     
     db_path = os.path.join(instance_dir, 'database.db')
-    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+    if not os.getenv('DATABASE_URL'):
+        app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
     
     # Ensure upload folder exists
     project_root = os.path.dirname(backend_dir)
@@ -71,11 +102,7 @@ def create_app():
     app.config['UPLOAD_FOLDER'] = upload_folder
     
     # CORS configuration (parse from environment)
-    raw_cors = os.getenv('CORS_ORIGINS', 'http://localhost:3000')
-    if raw_cors.strip() == '*':
-        cors_origins = '*'
-    else:
-        cors_origins = [o.strip() for o in raw_cors.split(',') if o.strip()]
+    cors_origins = _parse_cors_origins()
     app.config['CORS_ORIGINS'] = cors_origins
     
     # Initialize logging (log to stdout so Docker can capture it)
@@ -94,13 +121,19 @@ def create_app():
     logging.getLogger('werkzeug').setLevel(logging.INFO)  # Flask开发服务器日志保持INFO
     logging.getLogger('volcenginesdkarkruntime').setLevel(logging.WARNING)
 
+    # Session cookies back API and file authorization.
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
+    app.config['SESSION_COOKIE_SECURE'] = os.getenv('SESSION_COOKIE_SECURE', '0') == '1'
+
     # Initialize extensions
     db.init_app(app)
-    CORS(app, origins=cors_origins)
+    CORS(app, origins=cors_origins, supports_credentials=True)
     # Database migrations (Alembic via Flask-Migrate)
     Migrate(app, db)
     
     # Register blueprints
+    app.register_blueprint(auth_bp)
     app.register_blueprint(project_bp)
     app.register_blueprint(page_bp)
     app.register_blueprint(template_bp)
@@ -126,12 +159,31 @@ def create_app():
             return  # not enabled
         if not request.path.startswith('/api/'):
             return  # non-API routes (health, static, etc.)
-        if request.path.startswith('/api/access-code/'):
-            return  # allow check/verify endpoints
+        if request.path.startswith('/api/access-code/') or request.path.startswith('/api/auth/'):
+            return  # allow access-code and auth endpoints
         code = request.headers.get('X-Access-Code', '')
         if hmac.compare_digest(code, expected):
             return
         return jsonify({'error': 'Access code required'}), 403
+
+    @app.before_request
+    def _enforce_login():
+        from flask import request
+        from utils import error_response
+        from utils.auth import get_current_user
+
+        public_prefixes = (
+            '/api/auth/',
+            '/api/access-code/',
+        )
+        if request.path == '/health' or request.path == '/':
+            return
+        if any(request.path.startswith(prefix) for prefix in public_prefixes):
+            return
+        if request.path.startswith('/api/') or request.path.startswith('/files/'):
+            if get_current_user():
+                return
+            return error_response('AUTH_REQUIRED', 'Login required', 401)
 
     # Health check endpoint
     @app.route('/health')
@@ -161,16 +213,17 @@ def create_app():
     @app.route('/api/output-language', methods=['GET'])
     def get_output_language():
         """
-        获取用户的输出语言偏好（从数据库 Settings 读取）
+        获取当前用户的输出语言偏好。
         返回: zh, ja, en, auto
         """
-        from models import Settings
+        from models import UserSettings
+        from utils.auth import current_user_id
         try:
-            settings = Settings.get_settings()
+            settings = UserSettings.get_for_user(current_user_id())
             return {'data': {'language': settings.output_language or Config.OUTPUT_LANGUAGE}}
         except SQLAlchemyError as db_error:
-            logging.warning(f"Failed to load output language from settings: {db_error}")
-            return {'data': {'language': Config.OUTPUT_LANGUAGE}}  # 默认中文
+            logging.warning(f"Failed to load output language from user settings: {db_error}")
+            return {'data': {'language': Config.OUTPUT_LANGUAGE}}
 
     # Root endpoint
     @app.route('/')
@@ -358,7 +411,7 @@ if __name__ == '__main__':
         f"Environment: {os.getenv('FLASK_ENV', 'development')}\n"
         f"Debug mode: {debug}\n"
         f"API Base URL: http://localhost:{port}/api\n"
-        f"Database: {app.config['SQLALCHEMY_DATABASE_URI']}\n"
+        f"Database: {_safe_database_label(app.config['SQLALCHEMY_DATABASE_URI'])}\n"
         f"Uploads: {app.config['UPLOAD_FOLDER']}"
     )
     

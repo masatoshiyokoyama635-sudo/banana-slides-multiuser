@@ -17,8 +17,9 @@ from werkzeug.exceptions import BadRequest
 from werkzeug.utils import secure_filename
 
 from models import db, Project, Page, Task, ReferenceFile
+from utils.auth import current_user_id, get_current_user_project
 from services import ProjectContext, FileService
-from services.ai_service_manager import get_ai_service
+from services.user_ai import create_user_ai_service, create_user_file_parser, get_user_ai_config
 from services.task_manager import (
     task_manager,
     generate_descriptions_task,
@@ -35,19 +36,24 @@ logger = logging.getLogger(__name__)
 project_bp = Blueprint('projects', __name__, url_prefix='/api/projects')
 
 
-def _get_project_reference_files_content(project_id: str) -> list:
+def _get_project_reference_files_content(project_id: str, user_id: str) -> list:
     """
     Get reference files content for a project
-    
+
     Args:
         project_id: Project ID
-        
+        user_id: User ID for ownership filtering
+
     Returns:
         List of dicts with 'filename' and 'content' keys
     """
+    if not user_id:
+        return []
+
     reference_files = ReferenceFile.query.filter_by(
         project_id=project_id,
-        parse_status='completed'
+        parse_status='completed',
+        user_id=user_id,
     ).all()
     
     files_content = []
@@ -171,11 +177,14 @@ def list_projects():
         limit = min(max(1, limit), 100)  # Between 1-100
         offset = max(0, offset)  # Non-negative
 
+        user_id = current_user_id()
+
         # Get total count for pagination
-        total = Project.query.count()
+        total = Project.query.filter_by(user_id=user_id).count()
 
         projects = Project.query\
             .options(joinedload(Project.pages))\
+            .filter(Project.user_id == user_id)\
             .order_by(desc(Project.updated_at))\
             .limit(limit)\
             .offset(offset)\
@@ -232,6 +241,7 @@ def create_project():
 
         # Create project
         project = Project(
+            user_id=current_user_id(),
             creation_type=creation_type,
             idea_prompt=data.get('idea_prompt'),
             outline_text=data.get('outline_text'),
@@ -272,7 +282,7 @@ def get_project(project_id):
         # Use eager loading to load project and related pages
         project = Project.query\
             .options(joinedload(Project.pages))\
-            .filter(Project.id == project_id)\
+            .filter(Project.id == project_id, Project.user_id == current_user_id())\
             .first()
         
         if not project:
@@ -300,7 +310,7 @@ def update_project(project_id):
         # Use eager loading to load project and pages (for page order updates)
         project = Project.query\
             .options(joinedload(Project.pages))\
-            .filter(Project.id == project_id)\
+            .filter(Project.id == project_id, Project.user_id == current_user_id())\
             .first()
         
         if not project:
@@ -381,7 +391,7 @@ def delete_project(project_id):
     DELETE /api/projects/{project_id} - Delete project
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -419,20 +429,21 @@ def generate_outline(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get request data and language parameter
         data = request.get_json() or {}
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         # Get reference files content and create project context
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         if reference_files_content:
             logger.info(f"Found {len(reference_files_content)} reference files for project {project_id}")
             for rf in reference_files_content:
@@ -509,12 +520,14 @@ def generate_outline_stream(project_id):
       event: error   — error occurred {message}
     """
     # Validate project exists before entering the generator
-    project = Project.query.get(project_id)
+    project = get_current_user_project(project_id)
     if not project:
         return not_found('Project')
 
     data = request.get_json() or {}
-    language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+    user_id = current_user_id()
+    user_config = get_user_ai_config(user_id)
+    language = data.get('language', user_config.output_language)
 
     # Capture app reference for use inside the generator (which runs outside request context)
     app = current_app._get_current_object()
@@ -523,9 +536,12 @@ def generate_outline_stream(project_id):
         with app.app_context():
             try:
                 # Re-fetch project inside app context to attach to this session
-                proj = db.session.get(Project, project_id)
-                ai_service = get_ai_service()
-                reference_files_content = _get_project_reference_files_content(project_id)
+                proj = Project.query.filter_by(id=project_id, user_id=user_id).first()
+                if not proj:
+                    yield _sse_event('error', {'message': 'Project not found'})
+                    return
+                ai_service = create_user_ai_service(user_id)
+                reference_files_content = _get_project_reference_files_content(project_id, user_id)
 
                 # Validate input based on creation type
                 if proj.creation_type == 'outline' and not proj.outline_text:
@@ -633,7 +649,7 @@ def generate_from_description(project_id):
     """
     
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -644,7 +660,8 @@ def generate_from_description(project_id):
         # Get description text and language
         data = request.get_json() or {}
         description_text = data.get('description_text') or project.description_text
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         if not description_text:
             return bad_request("description_text is required")
@@ -652,10 +669,10 @@ def generate_from_description(project_id):
         project.description_text = description_text
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get reference files content and create project context
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         project_context = ProjectContext(project, reference_files_content)
         
         logger.info(f"开始从描述生成大纲和页面描述: 项目 {project_id}")
@@ -743,7 +760,7 @@ def generate_descriptions(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -766,11 +783,13 @@ def generate_descriptions(project_id):
         data = request.get_json() or {}
         # 从配置中读取默认并发数，如果请求中提供了则使用请求的值
         max_workers = data.get('max_workers', current_app.config.get('MAX_DESCRIPTION_WORKERS', 5))
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         detail_level = data.get('detail_level', 'default')
         
         # Create task
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='GENERATE_DESCRIPTIONS',
             status='PENDING'
@@ -785,10 +804,10 @@ def generate_descriptions(project_id):
         db.session.commit()
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get reference files content and create project context
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         project_context = ProjectContext(project, reference_files_content)
         
         # Get app instance for background task
@@ -836,7 +855,7 @@ def generate_descriptions_stream(project_id):
       event: done        — {total, pages: [...]}
       event: error       — {message}
     """
-    project = Project.query.get(project_id)
+    project = get_current_user_project(project_id)
     if not project:
         return not_found('Project')
 
@@ -844,7 +863,9 @@ def generate_descriptions_stream(project_id):
         return bad_request("Project must have outline generated first")
 
     data = request.get_json() or {}
-    language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+    user_id = current_user_id()
+    user_config = get_user_ai_config(user_id)
+    language = data.get('language', user_config.output_language)
     detail_level = data.get('detail_level', 'default')
 
     app = current_app._get_current_object()
@@ -852,9 +873,12 @@ def generate_descriptions_stream(project_id):
     def sse_generate():
         with app.app_context():
             try:
-                proj = db.session.get(Project, project_id)
-                ai_service = get_ai_service()
-                reference_files_content = _get_project_reference_files_content(project_id)
+                proj = Project.query.filter_by(id=project_id, user_id=user_id).first()
+                if not proj:
+                    yield _sse_event('error', {'message': 'Project not found'})
+                    return
+                ai_service = create_user_ai_service(user_id)
+                reference_files_content = _get_project_reference_files_content(project_id, user_id)
                 project_context = ProjectContext(proj, reference_files_content)
 
                 pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
@@ -934,7 +958,7 @@ def generate_descriptions_stream(project_id):
                 # 恢复未完成页面的状态：已生成描述的保留，未生成的恢复为 DRAFT
                 try:
                     pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
-                    proj = db.session.get(Project, project_id)
+                    proj = Project.query.filter_by(id=project_id, user_id=user_id).first()
                     has_any_desc = False
                     for page in pages:
                         if page.status == 'GENERATING_DESCRIPTION':
@@ -980,7 +1004,7 @@ def generate_images(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -995,7 +1019,11 @@ def generate_images(project_id):
         
         # Get page_ids from request body and fetch filtered pages
         selected_page_ids = parse_page_ids_from_body(data)
-        pages = get_filtered_pages(project_id, selected_page_ids if selected_page_ids else None)
+        pages = get_filtered_pages(
+            project_id,
+            selected_page_ids if selected_page_ids else None,
+            user_id=current_user_id(),
+        )
         
         if not pages:
             return bad_request("No pages found for project")
@@ -1006,7 +1034,7 @@ def generate_images(project_id):
         use_template = data.get('use_template', True)
         ref_image_path = None
         if use_template:
-            ref_image_path = file_service.get_template_path(project_id)
+            ref_image_path = file_service.get_template_path(project_id, current_user_id())
         
         if not ref_image_path and not project.template_style:
             return bad_request("请先上传模板图片或添加风格描述。")
@@ -1017,10 +1045,12 @@ def generate_images(project_id):
         # 从配置中读取默认并发数，如果请求中提供了则使用请求的值
         max_workers = data.get('max_workers', current_app.config.get('MAX_IMAGE_WORKERS', 8))
         use_template = data.get('use_template', True)
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         # Create task
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='GENERATE_IMAGES',
             status='PENDING'
@@ -1035,7 +1065,7 @@ def generate_images(project_id):
         db.session.commit()
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # 合并额外要求和风格描述
         combined_requirements = project.extra_requirements or ""
@@ -1092,9 +1122,12 @@ def get_task_status(project_id, task_id):
     GET /api/projects/{project_id}/tasks/{task_id} - Get task status
     """
     try:
-        task = Task.query.get(task_id)
-        
-        if not task or task.project_id != project_id:
+        task = Task.query.filter_by(
+            id=task_id,
+            project_id=project_id,
+            user_id=current_user_id()
+        ).first()
+        if not task:
             return not_found('Task')
         
         return success_response(task.to_dict())
@@ -1116,7 +1149,7 @@ def refine_outline(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -1143,10 +1176,10 @@ def refine_outline(project_id):
             current_outline = _reconstruct_outline_from_pages(pages)
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get reference files content and create project context
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         if reference_files_content:
             logger.info(f"Found {len(reference_files_content)} reference files for refine_outline")
             for rf in reference_files_content:
@@ -1158,7 +1191,8 @@ def refine_outline(project_id):
         
         # Get previous requirements and language from request
         previous_requirements = data.get('previous_requirements', [])
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         # Refine outline
         logger.info(f"开始修改大纲: 项目 {project_id}, 用户要求: {user_requirement}, 历史要求数: {len(previous_requirements)}")
@@ -1213,7 +1247,7 @@ def refine_descriptions(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         
         if not project:
             return not_found('Project')
@@ -1255,10 +1289,10 @@ def refine_descriptions(project_id):
             })
         
         # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get reference files content and create project context
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         if reference_files_content:
             logger.info(f"Found {len(reference_files_content)} reference files for refine_descriptions")
             for rf in reference_files_content:
@@ -1270,7 +1304,8 @@ def refine_descriptions(project_id):
         
         # Get previous requirements and language from request
         previous_requirements = data.get('previous_requirements', [])
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         # Refine descriptions
         logger.info(f"开始修改页面描述: 项目 {project_id}, 用户要求: {user_requirement}, 历史要求数: {len(previous_requirements)}")
@@ -1358,10 +1393,12 @@ def create_ppt_renovation_project():
 
         keep_layout = request.form.get('keep_layout', 'false').lower() == 'true'
         template_style = request.form.get('template_style', '').strip() or None
-        language = request.form.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = request.form.get('language', user_config.output_language)
 
         # Create project
         project = Project(
+            user_id=current_user_id(),
             creation_type='ppt_renovation',
             template_style=template_style,
             status='DRAFT'
@@ -1508,6 +1545,7 @@ def create_ppt_renovation_project():
 
         # Create async task
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='PPT_RENOVATION',
             status='PENDING'
@@ -1522,19 +1560,8 @@ def create_ppt_renovation_project():
         db.session.commit()
 
         # Get services
-        ai_service = get_ai_service()
-        from services.file_parser_service import FileParserService
-        file_parser_service = FileParserService(
-            mineru_token=current_app.config['MINERU_TOKEN'],
-            mineru_api_base=current_app.config['MINERU_API_BASE'],
-            google_api_key=current_app.config.get('GOOGLE_API_KEY', ''),
-            google_api_base=current_app.config.get('GOOGLE_API_BASE', ''),
-            openai_api_key=current_app.config.get('OPENAI_API_KEY', ''),
-            openai_api_base=current_app.config.get('OPENAI_API_BASE', ''),
-            image_caption_model=current_app.config['IMAGE_CAPTION_MODEL'],
-            provider_format=current_app.config.get('AI_PROVIDER_FORMAT', 'gemini'),
-            lazyllm_image_caption_source=current_app.config.get('IMAGE_CAPTION_MODEL_SOURCE', 'doubao'),
-        )
+        ai_service = create_user_ai_service(current_user_id())
+        file_parser_service = create_user_file_parser(current_user_id())
 
         app = current_app._get_current_object()
 
@@ -1600,7 +1627,7 @@ def extract_style():
             tmp_path = tmp.name
 
         try:
-            ai_service = get_ai_service()
+            ai_service = create_user_ai_service(current_user_id())
             style_description = ai_service.extract_style_description(tmp_path)
 
             return success_response({

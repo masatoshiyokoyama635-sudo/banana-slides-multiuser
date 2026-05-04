@@ -264,7 +264,7 @@ class FileService:
         Returns:
             True if deleted successfully
         """
-        filepath = self.upload_folder / image_path.replace('\\', '/')
+        filepath = Path(self.get_absolute_path(image_path))
         deleted = False
 
         if filepath.exists() and filepath.is_file():
@@ -278,16 +278,16 @@ class FileService:
             cache_filepath.unlink()
 
         return deleted
-    
+
     def get_file_url(self, project_id: Optional[str], file_type: str, filename: str) -> str:
         """
         Generate file URL for frontend access
-        
+
         Args:
             project_id: Project ID (None for global materials)
             file_type: 'template', 'pages', or 'materials'
             filename: File name
-        
+
         Returns:
             URL path for file access
         """
@@ -295,20 +295,28 @@ class FileService:
             # Global materials
             return f"/files/materials/{filename}"
         return f"/files/{project_id}/{file_type}/{filename}"
-    
+
     def get_absolute_path(self, relative_path: str) -> str:
         """
         Get absolute file path from relative path
-        
+
         Args:
             relative_path: Relative path from upload folder
-        
+
         Returns:
             Absolute file path
         """
-        result = (self.upload_folder / relative_path.replace('\\', '/')).resolve()
-        if not str(result).startswith(str(self.upload_folder.resolve())):
-            raise ValueError(f"Path traversal detected: {relative_path}")
+        if not relative_path:
+            raise ValueError("Path is required")
+        raw_path = Path(str(relative_path).replace('\\', '/'))
+        if raw_path.is_absolute():
+            raise ValueError(f"Absolute paths are not allowed: {relative_path}")
+        base = self.upload_folder.resolve()
+        result = (base / raw_path).resolve()
+        try:
+            result.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(f"Path traversal detected: {relative_path}") from exc
         return str(result)
     
     def delete_template(self, project_id: str) -> bool:
@@ -371,42 +379,49 @@ class FileService:
     
     def file_exists(self, relative_path: str) -> bool:
         """Check if file exists"""
-        filepath = self.upload_folder / relative_path.replace('\\', '/')
+        try:
+            filepath = Path(self.get_absolute_path(relative_path))
+        except ValueError:
+            return False
         return filepath.exists() and filepath.is_file()
-    
-    def get_template_path(self, project_id: str) -> Optional[str]:
+
+    def get_template_path(self, project_id: str, user_id: str) -> Optional[str]:
         """
         Get template file path for project
-        
+
         Args:
             project_id: Project ID
-        
+            user_id: Owner ID used to enforce project ownership
+
         Returns:
             Absolute path to template file or None
         """
-        
+
         # 刷新数据库会话，确保获取最新数据
         db.session.expire_all()
-        project = Project.query.get(project_id)
-        if project and project.template_image_path:
+        query = Project.query.filter_by(id=project_id, user_id=user_id)
+        project = query.first()
+        if not project:
+            return None
+        if project.template_image_path:
             # template_image_path 是相对路径，需要转换为绝对路径
             template_path = self.upload_folder / project.template_image_path
             if template_path.exists() and template_path.is_file():
                 return str(template_path)
-        
+
         # 如果数据库中没有，回退到目录查找（兼容旧数据）
         template_dir = self._get_template_dir(project_id)
         if template_dir.exists():
             # 按修改时间排序，返回最新的模板文件
             template_files = [
-                f for f in template_dir.iterdir() 
+                f for f in template_dir.iterdir()
                 if f.is_file() and f.stem == 'template'
             ]
             if template_files:
                 # 返回修改时间最新的文件
                 latest_file = max(template_files, key=lambda f: f.stat().st_mtime)
                 return str(latest_file)
-        
+
         return None
     
     def _get_user_templates_dir(self) -> Path:
@@ -476,7 +491,7 @@ class FileService:
         """
         try:
             # Get full path to original image
-            original_full_path = self.upload_folder / original_path.replace('\\', '/')
+            original_full_path = Path(self.get_absolute_path(original_path))
 
             if not original_full_path.exists():
                 return None

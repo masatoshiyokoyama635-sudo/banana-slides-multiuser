@@ -5,8 +5,9 @@ import logging
 from flask import Blueprint, request, current_app
 from models import db, Project, Page, PageImageVersion, Task
 from utils import success_response, error_response, not_found, bad_request
+from utils.auth import current_user_id, get_current_user_project
 from services import FileService, ProjectContext
-from services.ai_service_manager import get_ai_service
+from services.user_ai import create_user_ai_service, create_user_file_parser, get_user_ai_config
 from services.task_manager import task_manager, generate_single_page_image_task, edit_page_image_task
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,24 @@ import json
 logger = logging.getLogger(__name__)
 
 page_bp = Blueprint('pages', __name__, url_prefix='/api/projects')
+
+
+def _get_user_project_or_404(project_id: str):
+    project = get_current_user_project(project_id)
+    if not project:
+        return None, not_found('Project')
+    return project, None
+
+
+def _get_user_project_page_or_404(project_id: str, page_id: str):
+    project, error = _get_user_project_or_404(project_id)
+    if error:
+        return None, None, error
+
+    page = Page.query.filter_by(id=page_id, project_id=project_id).first()
+    if not page:
+        return project, None, not_found('Page')
+    return project, page, None
 
 
 @page_bp.route('/<project_id>/pages', methods=['POST'])
@@ -33,11 +52,10 @@ def create_page(project_id):
     }
     """
     try:
-        project = Project.query.get(project_id)
-        
-        if not project:
-            return not_found('Project')
-        
+        project, error = _get_user_project_or_404(project_id)
+        if error:
+            return error
+
         data = request.get_json()
         
         if not data or 'order_index' not in data:
@@ -86,10 +104,9 @@ def delete_page(project_id, page_id):
     DELETE /api/projects/{project_id}/pages/{page_id} - Delete page
     """
     try:
-        page = Page.query.get(page_id)
-
-        if not page or page.project_id != project_id:
-            return not_found('Page')
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
 
         # Delete page image if exists
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
@@ -99,9 +116,7 @@ def delete_page(project_id, page_id):
         db.session.delete(page)
 
         # Update project
-        project = Project.query.get(project_id)
-        if project:
-            project.updated_at = datetime.utcnow()
+        project.updated_at = datetime.utcnow()
 
         db.session.commit()
 
@@ -123,10 +138,9 @@ def update_page(project_id, page_id):
     }
     """
     try:
-        page = Page.query.get(page_id)
-
-        if not page or page.project_id != project_id:
-            return not_found('Page')
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
 
         data = request.get_json()
 
@@ -140,8 +154,7 @@ def update_page(project_id, page_id):
         page.updated_at = datetime.utcnow()
 
         # Update project
-        if page.project:
-            page.project.updated_at = datetime.utcnow()
+        project.updated_at = datetime.utcnow()
 
         db.session.commit()
 
@@ -164,11 +177,10 @@ def update_page_outline(project_id, page_id):
     }
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         data = request.get_json()
         
         if not data or 'outline_content' not in data:
@@ -178,9 +190,7 @@ def update_page_outline(project_id, page_id):
         page.updated_at = datetime.utcnow()
         
         # Update project
-        project = Project.query.get(project_id)
-        if project:
-            project.updated_at = datetime.utcnow()
+        project.updated_at = datetime.utcnow()
         
         db.session.commit()
         
@@ -206,11 +216,10 @@ def update_page_description(project_id, page_id):
     }
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         data = request.get_json()
         
         if not data or 'description_content' not in data:
@@ -220,9 +229,7 @@ def update_page_description(project_id, page_id):
         page.updated_at = datetime.utcnow()
         
         # Update project
-        project = Project.query.get(project_id)
-        if project:
-            project.updated_at = datetime.utcnow()
+        project.updated_at = datetime.utcnow()
         
         db.session.commit()
         
@@ -244,18 +251,14 @@ def generate_page_description(project_id, page_id):
     }
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
-        project = Project.query.get(project_id)
-        if not project:
-            return not_found('Project')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         data = request.get_json() or {}
         force_regenerate = data.get('force_regenerate', False)
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         detail_level = data.get('detail_level', 'default')
 
         # Check if already generated
@@ -279,11 +282,11 @@ def generate_page_description(project_id, page_id):
                 outline.append(page_data)
         
         # Initialize AI service
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         # Get reference files content and create project context
         from controllers.project_controller import _get_project_reference_files_content
-        reference_files_content = _get_project_reference_files_content(project_id)
+        reference_files_content = _get_project_reference_files_content(project_id, current_user_id())
         project_context = ProjectContext(project, reference_files_content)
         
         # Generate description
@@ -310,8 +313,7 @@ def generate_page_description(project_id, page_id):
         
         page.set_description_content(desc_content)
         page.status = 'DESCRIPTION_GENERATED'
-        page.updated_at = datetime.utcnow()
-        
+        project.updated_at = datetime.utcnow()
         db.session.commit()
         
         return success_response(page.to_dict())
@@ -333,19 +335,15 @@ def generate_page_image(project_id, page_id):
     }
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
-        project = Project.query.get(project_id)
-        if not project:
-            return not_found('Project')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         data = request.get_json() or {}
         use_template = data.get('use_template', True)
         force_regenerate = data.get('force_regenerate', False)
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         
         # Check if already generated
         if page.generated_image_path and not force_regenerate:
@@ -405,14 +403,14 @@ def generate_page_image(project_id, page_id):
             })
         
         # Initialize services
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
         
         # Get template path
         ref_image_path = None
         if use_template:
-            ref_image_path = file_service.get_template_path(project_id)
+            ref_image_path = file_service.get_template_path(project_id, current_user_id())
         
         # 检查是否有模板图片或风格描述
         # 如果都没有，则返回错误
@@ -454,6 +452,7 @@ def generate_page_image(project_id, page_id):
         
         # Create async task for image generation
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='GENERATE_PAGE_IMAGE',
             status='PENDING'
@@ -520,20 +519,15 @@ def edit_page_image(project_id, page_id):
     - context_images: file uploads (multiple files with key "context_images")
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         if not page.generated_image_path:
             return bad_request("Page must have generated image first")
         
-        project = Project.query.get(project_id)
-        if not project:
-            return not_found('Project')
-        
         # Initialize services
-        ai_service = get_ai_service()
+        ai_service = create_user_ai_service(current_user_id())
         
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
         
@@ -557,9 +551,6 @@ def edit_page_image(project_id, page_id):
         
         if not data or 'edit_instruction' not in data:
             return bad_request("edit_instruction is required")
-        
-        # Get current image path
-        current_image_path = file_service.get_absolute_path(page.generated_image_path)
         
         # Get original description if available
         original_description = None
@@ -585,7 +576,7 @@ def edit_page_image(project_id, page_id):
             use_template = data.get('use_template', 'false').lower() == 'true'
         
         if use_template:
-            template_path = file_service.get_template_path(project_id)
+            template_path = file_service.get_template_path(project_id, current_user_id())
             if template_path:
                 additional_ref_images.append(template_path)
         
@@ -627,6 +618,7 @@ def edit_page_image(project_id, page_id):
         
         # Create async task for image editing
         task = Task(
+            user_id=current_user_id(),
             project_id=project_id,
             task_type='EDIT_PAGE_IMAGE',
             status='PENDING'
@@ -678,11 +670,10 @@ def get_page_image_versions(project_id, page_id):
     GET /api/projects/{project_id}/pages/{page_id}/image-versions - Get all image versions for a page
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
         versions = PageImageVersion.query.filter_by(page_id=page_id)\
             .order_by(PageImageVersion.version_number.desc()).all()
         
@@ -701,16 +692,14 @@ def set_current_image_version(project_id, page_id, version_id):
     Set a specific version as the current one
     """
     try:
-        page = Page.query.get(page_id)
-        
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-        
-        version = PageImageVersion.query.get(version_id)
-        
-        if not version or version.page_id != page_id:
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
+
+        version = PageImageVersion.query.filter_by(id=version_id, page_id=page_id).first()
+        if not version:
             return not_found('Image Version')
-        
+
         # Mark all versions as not current
         PageImageVersion.query.filter_by(page_id=page_id).update({'is_current': False})
 
@@ -747,21 +736,17 @@ def regenerate_renovation_page(project_id, page_id):
     This re-runs the renovation pipeline for a single page.
     """
     try:
-        page = Page.query.get(page_id)
-
-        if not page or page.project_id != project_id:
-            return not_found('Page')
-
-        project = Project.query.get(project_id)
-        if not project:
-            return not_found('Project')
+        project, page, error = _get_user_project_page_or_404(project_id, page_id)
+        if error:
+            return error
 
         # Verify this is a renovation project
         if project.creation_type != 'ppt_renovation':
             return bad_request("This endpoint is only for PPT renovation projects")
 
         data = request.get_json() or {}
-        language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
+        user_config = get_user_ai_config(current_user_id())
+        language = data.get('language', user_config.output_language)
         keep_layout = data.get('keep_layout', False)
 
         # Find the split PDF for this page
@@ -773,19 +758,8 @@ def regenerate_renovation_page(project_id, page_id):
             return bad_request(f"Split PDF not found for page {page.order_index + 1}")
 
         # Initialize services
-        ai_service = get_ai_service()
-        from services.file_parser_service import FileParserService
-        file_parser_service = FileParserService(
-            mineru_api_base=current_app.config.get('MINERU_API_BASE', ''),
-            mineru_token=current_app.config.get('MINERU_TOKEN', ''),
-            google_api_key=current_app.config.get('GOOGLE_API_KEY', ''),
-            ai_provider_format=current_app.config.get('AI_PROVIDER_FORMAT', 'gemini'),
-            openai_api_key=current_app.config.get('OPENAI_API_KEY', ''),
-            openai_api_base=current_app.config.get('OPENAI_API_BASE', ''),
-            image_caption_model=current_app.config.get('IMAGE_CAPTION_MODEL', 'gemini-3-flash-preview'),
-            lazyllm_image_caption_source=current_app.config.get('IMAGE_CAPTION_MODEL_SOURCE', ''),
-            upload_folder=current_app.config.get('UPLOAD_FOLDER', 'uploads')
-        )
+        ai_service = create_user_ai_service(current_user_id())
+        file_parser_service = create_user_file_parser(current_user_id())
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
 
         # Step 1: Parse page PDF → markdown

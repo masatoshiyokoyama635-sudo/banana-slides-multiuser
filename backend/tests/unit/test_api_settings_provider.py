@@ -1,71 +1,82 @@
 """
-Settings controller tests for provider format handling.
+Settings controller tests for user-owned API key behavior.
 """
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from config import Config
+from conftest import assert_success_response
+from models import UserSettings
 
-from flask import Flask
-
-from controllers.settings_controller import update_settings, verify_api_key
-
-
-def _build_settings(**overrides):
-    defaults = {
-        'ai_provider_format': 'gemini',
-        'api_key': None,
-        'api_base_url': None,
-        'text_model': None,
-    }
-    defaults.update(overrides)
-
-    settings = SimpleNamespace(**defaults)
-    settings.to_dict = lambda: {
-        'ai_provider_format': settings.ai_provider_format,
-        'api_key_length': len(settings.api_key) if settings.api_key else 0,
-    }
-    return settings
+HIDDEN_USER_SETTING_KEYS = {
+    "ai_provider_format",
+    "api_base_url",
+    "text_model",
+    "image_model",
+    "image_caption_model",
+    "text_model_source",
+    "image_model_source",
+    "image_caption_model_source",
+    "text_api_base_url",
+    "image_api_base_url",
+    "image_caption_api_base_url",
+}
 
 
-def test_update_settings_accepts_lazyllm_provider():
-    """`lazyllm` should be accepted as a valid provider format."""
-    app = Flask(__name__)
-
-    settings = _build_settings()
-    with app.app_context():
-        with app.test_request_context('/api/settings/', method='PUT', json={'ai_provider_format': 'lazyllm'}):
-            with patch('controllers.settings_controller.Settings.get_settings', return_value=settings):
-                with patch('controllers.settings_controller.db.session.commit'):
-                    with patch('controllers.settings_controller._sync_settings_to_config'):
-                        response, status_code = update_settings()
-
-    assert status_code == 200
-    data = response.get_json()
-    assert data['success'] is True
-    assert data['data']['ai_provider_format'] == 'lazyllm'
+def test_default_openai_proxy_and_gpt_image_model_config():
+    assert Config.AI_PROVIDER_FORMAT == "openai"
+    assert Config.OPENAI_API_BASE == "https://ai.zh-zh.top/v1"
+    assert Config.TEXT_MODEL == "gpt-5.5"
+    assert Config.IMAGE_MODEL == "gpt-image-2"
+    assert Config.IMAGE_CAPTION_MODEL == "gpt-5.5"
 
 
-def test_verify_uses_configured_text_model():
-    """Verify endpoint should use configured text model, not a hardcoded gemini model."""
-    app = Flask(__name__)
-    app.config.update(
-        TEXT_MODEL='gemini-3-flash-preview',
-        AI_PROVIDER_FORMAT='lazyllm',
+def test_settings_response_does_not_expose_hidden_proxy_or_model_config(client):
+    response = client.get("/api/settings")
+    data = assert_success_response(response)
+    assert HIDDEN_USER_SETTING_KEYS.isdisjoint(data["data"].keys())
+
+    active_config_response = client.get("/api/settings/active-config")
+    assert active_config_response.status_code == 404
+
+
+def test_update_settings_saves_only_user_api_key(client):
+    response = client.put(
+        "/api/settings",
+        json={
+            "api_key": " user-secret-key ",
+            "ai_provider_format": "gemini",
+            "api_base_url": "https://evil.example/v1",
+            "text_model": "evil-text-model",
+            "image_model": "evil-image-model",
+            "image_caption_model": "evil-caption-model",
+        },
     )
+    data = assert_success_response(response)
+    assert data["data"]["api_key_length"] == len("user-secret-key")
+    assert HIDDEN_USER_SETTING_KEYS.isdisjoint(data["data"].keys())
 
-    settings = _build_settings(ai_provider_format='lazyllm', text_model='deepseek-chat')
-    mock_provider = MagicMock()
-    mock_provider.generate_text.return_value = 'OK'
+    with client.application.app_context():
+        settings = UserSettings.query.one()
+        assert settings.api_key == "user-secret-key"
+        assert settings.ai_provider_format is None
+        assert settings.api_base_url is None
+        assert settings.text_model is None
+        assert settings.image_model is None
+        assert settings.image_caption_model is None
 
-    with app.app_context():
-        with app.test_request_context('/api/settings/verify', method='POST'):
-            with patch('controllers.settings_controller.Settings.get_settings', return_value=settings):
-                with patch('services.ai_providers.get_text_provider', return_value=mock_provider) as mock_get_provider:
-                    response, status_code = verify_api_key()
 
-    assert status_code == 200
-    data = response.get_json()
-    assert data['success'] is True
-    assert data['data']['available'] is True
-    mock_get_provider.assert_called_once_with(model='deepseek-chat')
-    mock_provider.generate_text.assert_called_once()
+def test_reset_settings_clears_user_api_key(client):
+    assert_success_response(client.put("/api/settings", json={"api_key": "user-secret-key"}))
+
+    response = client.post("/api/settings/reset")
+    data = assert_success_response(response)
+    assert data["data"]["api_key_length"] == 0
+    assert HIDDEN_USER_SETTING_KEYS.isdisjoint(data["data"].keys())
+
+    with client.application.app_context():
+        settings = UserSettings.query.one()
+        assert settings.api_key is None
+
+
+def test_platform_settings_tests_are_not_user_accessible(client):
+    response = client.post("/api/settings/tests/mineru-pdf", json={"api_key": "user-secret-key"})
+    assert response.status_code == 404

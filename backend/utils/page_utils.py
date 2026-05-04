@@ -37,24 +37,30 @@ def parse_page_ids_from_body(data: dict) -> List[str]:
     return page_ids
 
 
-def get_filtered_pages(project_id: str, page_ids: Optional[List[str]] = None):
+def get_filtered_pages(project_id: str, page_ids: Optional[List[str]] = None, user_id: Optional[str] = None):
     """
     Fetch pages for a project, optionally filtered by page IDs.
-    
+
     Args:
         project_id: Project ID
         page_ids: Optional list of page IDs to filter by
-        
+        user_id: Optional user ID for ownership filtering
+
     Returns:
         List of Page objects ordered by order_index
     """
-    from models import Page
-    
-    if page_ids:
-        return Page.query.filter(
+    from models import Page, Project
+
+    if user_id is not None:
+        query = Page.query.join(Project, Page.project_id == Project.id).filter(
             Page.project_id == project_id,
-            Page.id.in_(page_ids)
-        ).order_by(Page.order_index).all()
+            Project.user_id == user_id,
+        )
     else:
-        return Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+        query = Page.query.filter(Page.project_id == project_id)
+
+    if page_ids:
+        query = query.filter(Page.id.in_(page_ids))
+
+    return query.order_by(Page.order_index).all()
 

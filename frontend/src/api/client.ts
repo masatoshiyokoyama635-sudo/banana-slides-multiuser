@@ -8,6 +8,7 @@ const API_BASE_URL = '';
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: 300000, // 5分钟超时（AI生成可能很慢）
+  withCredentials: true,
 });
 
 // 请求拦截器
@@ -44,6 +45,10 @@ apiClient.interceptors.response.use(
     return response;
   },
   (error) => {
+    if (error.response?.status === 401 && !error.config?.url?.startsWith('/api/auth/')) {
+      window.dispatchEvent(new Event('banana-auth-required'));
+    }
+
     // 统一错误处理
     if (error.response) {
       // 服务器返回错误状态码

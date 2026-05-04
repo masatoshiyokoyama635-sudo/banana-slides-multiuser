@@ -52,6 +52,7 @@ interface ExportTasksState {
   updateTask: (id: string, updates: Partial<ExportTask>) => void;
   removeTask: (id: string) => void;
   clearCompleted: () => void;
+  clearAll: () => void;
   pollTask: (id: string, projectId: string, taskId: string) => Promise<void>;
   restoreActiveTasks: () => void; // 恢复正在进行的任务并重新开始轮询
 }
@@ -111,6 +112,10 @@ export const useExportTasksStore = create<ExportTasksState>()(
             (task) => task.status !== 'COMPLETED' && task.status !== 'FAILED'
           ),
         }));
+      },
+
+      clearAll: () => {
+        set({ tasks: [] });
       },
 
       pollTask: async (id, projectId, taskId) => {

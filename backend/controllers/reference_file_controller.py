@@ -13,13 +13,18 @@ from datetime import datetime
 from urllib.parse import unquote
 import threading
 
-from models import db, ReferenceFile, Project
+from models import db, ReferenceFile
+from utils.auth import current_user_id, get_current_user_project
 from utils.response import success_response, error_response, bad_request, not_found
-from services.file_parser_service import FileParserService
+from services.user_ai import create_user_file_parser
 
 logger = logging.getLogger(__name__)
 
 reference_file_bp = Blueprint('reference_file', __name__)
+
+
+def _get_user_reference_file(file_id: str):
+    return ReferenceFile.query.filter_by(id=file_id, user_id=current_user_id()).first()
 
 
 def _allowed_file(filename: str, allowed_extensions: set) -> bool:
@@ -35,7 +40,7 @@ def _get_file_type(filename: str) -> str:
     return 'unknown'
 
 
-def _parse_file_async(file_id: str, file_path: str, filename: str, app):
+def _parse_file_async(file_id: str, file_path: str, filename: str, app, user_id: str):
     """
     Parse file asynchronously in background
     
@@ -47,28 +52,20 @@ def _parse_file_async(file_id: str, file_path: str, filename: str, app):
     """
     with app.app_context():
         try:
-            reference_file = ReferenceFile.query.get(file_id)
+            reference_file = ReferenceFile.query.filter_by(id=file_id, user_id=user_id).first()
             if not reference_file:
-                logger.error(f"Reference file {file_id} not found")
+                logger.error(f"Reference file {file_id} not found for owner {user_id}")
+                return
+            if not reference_file.user_id:
+                logger.error(f"Reference file {file_id} has no owner")
                 return
             
             # Update status to parsing
             reference_file.parse_status = 'parsing'
             db.session.commit()
             
-            # Initialize parser service
-            parser = FileParserService(
-                mineru_token=current_app.config['MINERU_TOKEN'],
-                mineru_api_base=current_app.config['MINERU_API_BASE'],
-                google_api_key=current_app.config.get('GOOGLE_API_KEY', ''),
-                google_api_base=current_app.config.get('GOOGLE_API_BASE', ''),
-                openai_api_key=current_app.config.get('OPENAI_API_KEY', ''),
-                openai_api_base=current_app.config.get('OPENAI_API_BASE', ''),
-                image_caption_model=current_app.config['IMAGE_CAPTION_MODEL'],
-                provider_format=current_app.config.get('AI_PROVIDER_FORMAT', 'gemini'),
-                lazyllm_image_caption_source=current_app.config.get('IMAGE_CAPTION_MODEL_SOURCE', 'doubao'),
-            )
-            
+            parser = create_user_file_parser(reference_file.user_id)
+
             # Parse file
             logger.info(f"Starting to parse file: {filename}")
             batch_id, markdown_content, extract_id, error_message, failed_image_count = parser.parse_file(file_path, filename)
@@ -93,7 +90,7 @@ def _parse_file_async(file_id: str, file_path: str, filename: str, app):
         except Exception as e:
             logger.error(f"Error in async file parsing: {str(e)}", exc_info=True)
             try:
-                reference_file = ReferenceFile.query.get(file_id)
+                reference_file = ReferenceFile.query.filter_by(id=file_id, user_id=user_id).first()
                 if reference_file:
                     reference_file.parse_status = 'failed'
                     reference_file.error_message = f"Parsing error: {str(e)}"
@@ -154,7 +151,7 @@ def upload_reference_file():
             project_id = None
         else:
             # Verify project exists
-            project = Project.query.get(project_id)
+            project = get_current_user_project(project_id)
             if not project:
                 return not_found('Project')
         
@@ -188,6 +185,7 @@ def upload_reference_file():
         
         # Create database record
         reference_file = ReferenceFile(
+            user_id=current_user_id(),
             project_id=project_id,
             filename=original_filename,
             file_path=str(file_path.relative_to(upload_folder)),
@@ -220,7 +218,7 @@ def get_reference_file(file_id):
         Reference file information including parse status
     """
     try:
-        reference_file = ReferenceFile.query.get(file_id)
+        reference_file = _get_user_reference_file(file_id)
         if not reference_file:
             return not_found('Reference file')
         
@@ -241,7 +239,7 @@ def delete_reference_file(file_id):
         Success message
     """
     try:
-        reference_file = ReferenceFile.query.get(file_id)
+        reference_file = _get_user_reference_file(file_id)
         if not reference_file:
             return not_found('Reference file')
         
@@ -282,19 +280,17 @@ def list_project_reference_files(project_id):
         List of reference files
     """
     try:
-        # Special case: 'all' means list all files
+        query = ReferenceFile.query.filter(ReferenceFile.user_id == current_user_id())
         if project_id == 'all':
-            reference_files = ReferenceFile.query.all()
-        # Special case: 'global' or 'none' means list global files (not associated with any project)
+            reference_files = query.order_by(ReferenceFile.created_at.desc()).all()
         elif project_id in ['global', 'none']:
-            reference_files = ReferenceFile.query.filter_by(project_id=None).all()
+            reference_files = query.filter(ReferenceFile.project_id.is_(None)).order_by(ReferenceFile.created_at.desc()).all()
         else:
-            # Verify project exists
-            project = Project.query.get(project_id)
+            project = get_current_user_project(project_id)
             if not project:
                 return not_found('Project')
-            
-            reference_files = ReferenceFile.query.filter_by(project_id=project_id).all()
+
+            reference_files = query.filter(ReferenceFile.project_id == project.id).order_by(ReferenceFile.created_at.desc()).all()
         
         # 列表查询时不包含 markdown_content 和失败计数，加快响应速度
         return success_response({
@@ -315,7 +311,7 @@ def trigger_file_parse(file_id):
         Updated reference file information
     """
     try:
-        reference_file = ReferenceFile.query.get(file_id)
+        reference_file = _get_user_reference_file(file_id)
         if not reference_file:
             return not_found('Reference file')
         
@@ -345,7 +341,13 @@ def trigger_file_parse(file_id):
         # 启动异步解析
         thread = threading.Thread(
             target=_parse_file_async,
-            args=(reference_file.id, str(file_path), reference_file.filename, current_app._get_current_object())
+            args=(
+                reference_file.id,
+                str(file_path),
+                reference_file.filename,
+                current_app._get_current_object(),
+                current_user_id(),
+            )
         )
         thread.daemon = True
         thread.start()
@@ -376,7 +378,7 @@ def associate_file_to_project(file_id):
         Updated reference file information
     """
     try:
-        reference_file = ReferenceFile.query.get(file_id)
+        reference_file = _get_user_reference_file(file_id)
         if not reference_file:
             return not_found('Reference file')
         
@@ -387,7 +389,7 @@ def associate_file_to_project(file_id):
             return bad_request("project_id is required")
         
         # Verify project exists
-        project = Project.query.get(project_id)
+        project = get_current_user_project(project_id)
         if not project:
             return not_found('Project')
         
@@ -417,7 +419,7 @@ def dissociate_file_from_project(file_id):
         Updated reference file information
     """
     try:
-        reference_file = ReferenceFile.query.get(file_id)
+        reference_file = _get_user_reference_file(file_id)
         if not reference_file:
             return not_found('Reference file')
         

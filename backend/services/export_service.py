@@ -1155,6 +1155,7 @@ class ExportService:
         progress_callback = None,  # 可选：进度回调函数 (step, message, percent) -> None
         export_extractor_method: str = 'hybrid',  # 组件提取方法: mineru, hybrid
         export_inpaint_method: str = 'hybrid',  # 背景修复方法: generative, baidu, hybrid
+        ai_service = None,  # 用户级 AI 服务，用于生成式背景修复
         fail_fast: bool = True  # 是否在遇到错误时立即停止（False则收集警告继续）
     ) -> Tuple[Optional[bytes], ExportWarnings]:
         """
@@ -1180,6 +1181,7 @@ class ExportService:
                 可通过 TextAttributeExtractorFactory.create_caption_model_extractor() 创建
             export_extractor_method: 组件提取方法 ('mineru' 或 'hybrid'，默认 'hybrid')
             export_inpaint_method: 背景修复方法 ('generative', 'baidu', 'hybrid'，默认 'hybrid')
+            ai_service: 用户级 AI 服务，用于生成式背景修复（需要生成式/混合 inpaint 时必填）
             fail_fast: 是否在遇到错误时立即停止（默认 True）。设为 False 则收集警告继续导出。
 
         Returns:
@@ -1219,7 +1221,8 @@ class ExportService:
             config = ServiceConfig.from_defaults(
                 max_depth=max_depth,
                 extractor_method=export_extractor_method,
-                inpaint_method=export_inpaint_method
+                inpaint_method=export_inpaint_method,
+                ai_service=ai_service
             )
             editability_service = ImageEditabilityService(config)
             

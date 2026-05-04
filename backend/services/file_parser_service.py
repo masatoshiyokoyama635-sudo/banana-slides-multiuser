@@ -57,7 +57,8 @@ class FileParserService:
                  google_api_key: str = "", google_api_base: str = "",
                  openai_api_key: str = "", openai_api_base: str = "",
                  image_caption_model: str = "gemini-3-flash-preview",
-                 lazyllm_image_caption_source: str = "", 
+                 lazyllm_image_caption_source: str = "",
+                 lazyllm_api_keys: dict | None = None,
                  provider_format: str = None,
                  mineru_model_version: str = "vlm",
                  ):
@@ -89,7 +90,12 @@ class FileParserService:
         self._openai_api_base = openai_api_base
         self._image_caption_model = image_caption_model
         self._lazyllm_image_caption_source = lazyllm_image_caption_source
-        
+        self._lazyllm_api_keys = {
+            (vendor or "").lower(): key
+            for vendor, key in (lazyllm_api_keys or {}).items()
+            if vendor and key
+        }
+
         # Clients will be initialized lazily based on AI_PROVIDER_FORMAT
         self._gemini_client = None
         self._openai_client = None
@@ -117,13 +123,27 @@ class FileParserService:
             )
         return self._openai_client
     
+    def _get_lazyllm_api_key(self, source: str) -> str:
+        return self._lazyllm_api_keys.get((source or "").lower()) or get_lazyllm_api_key(source, namespace='BANANA')
+
+    def _apply_lazyllm_api_key(self, source: str) -> bool:
+        source_upper = (source or "").upper()
+        if not source_upper:
+            return False
+        api_key = self._get_lazyllm_api_key(source)
+        if api_key:
+            os.environ[f"{source_upper}_API_KEY"] = api_key
+            os.environ[f"BANANA_{source_upper}_API_KEY"] = api_key
+            return True
+        return ensure_lazyllm_namespace_key(source, namespace='BANANA')
+
     def _get_lazyllm_client(self):
         """Lazily initialize LazyLLM client"""
         if self._lazyllm_client is None:
             import lazyllm
             source = self._lazyllm_image_caption_source or "qwen"
             model = self._image_caption_model or "qwen-vl-plus"
-            ensure_lazyllm_namespace_key(source, namespace='BANANA')
+            self._apply_lazyllm_api_key(source)
 
             self._lazyllm_client = lazyllm.namespace('BANANA').OnlineModule(
                 source=source,
@@ -137,8 +157,8 @@ class FileParserService:
         if self._provider_format == 'openai':
             return bool(self._openai_api_key)
         elif self._provider_format == 'lazyllm':
-            source = self._lazyllm_image_caption_source or "qwen"
-            return bool(get_lazyllm_api_key(source, namespace='BANANA'))
+            source = (self._lazyllm_image_caption_source or "qwen").lower()
+            return bool(self._lazyllm_api_keys.get(source) or get_lazyllm_api_key(source, namespace='BANANA'))
         else:
             return bool(self._google_api_key)
     
