@@ -143,21 +143,17 @@ class TestGenerateImageCaption:
             result = _generate_image_caption('/nonexistent/path/image.png')
             assert result == ''
 
-    @patch('google.genai.Client')
-    def test_caption_gemini_success(self, mock_client_class, app):
-        """Caption with Gemini provider returns expected text"""
+    @patch('controllers.material_controller.create_user_ai_service')
+    def test_caption_uses_user_scoped_ai_service(self, mock_create_ai_service, app, client):
+        """Caption returns text from the user-scoped AI service"""
+        with client.session_transaction() as session:
+            user_id = session['user_id']
+
+        mock_ai_service = MagicMock()
+        mock_ai_service._generate_text_from_image.return_value = '一张测试图片'
+        mock_create_ai_service.return_value = mock_ai_service
+
         with app.app_context():
-            app.config['AI_PROVIDER_FORMAT'] = 'gemini'
-            app.config['GOOGLE_API_KEY'] = 'test-key'
-            app.config['GOOGLE_API_BASE'] = ''
-            app.config['IMAGE_CAPTION_MODEL'] = 'test-model'
-
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_result = MagicMock()
-            mock_result.text = '  一张测试图片  '
-            mock_client.models.generate_content.return_value = mock_result
-
             from controllers.material_controller import _generate_image_caption
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
@@ -167,7 +163,9 @@ class TestGenerateImageCaption:
             try:
                 result = _generate_image_caption(tmp_path)
                 assert result == '一张测试图片'
-                mock_client.models.generate_content.assert_called_once()
+                mock_create_ai_service.assert_called_once_with(user_id)
+                mock_ai_service._generate_text_from_image.assert_called_once()
+                assert mock_ai_service._generate_text_from_image.call_args.args[1] == tmp_path
             finally:
                 import os
                 os.unlink(tmp_path)

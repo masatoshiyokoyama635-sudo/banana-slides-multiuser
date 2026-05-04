@@ -76,10 +76,10 @@ def mock_heavy_deps():
     pix.save.side_effect = fake_pix_save
 
     with (
-        patch('controllers.project_controller.get_ai_service', return_value=mock_ai),
+        patch('controllers.project_controller.create_user_ai_service', return_value=mock_ai),
+        patch('controllers.project_controller.create_user_file_parser', return_value=MagicMock()),
         patch('controllers.project_controller.task_manager') as mock_tm,
         patch('controllers.project_controller.subprocess.run'),   # 跳过 LibreOffice
-        patch('services.file_parser_service.FileParserService', return_value=MagicMock()),
         patch.dict('sys.modules', {
             'fitz': mock_fitz,                                      # fitz 内联 import
         }),

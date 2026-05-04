@@ -248,18 +248,16 @@ export const Settings: React.FC = () => {
       }
 
       let isActive = true;
-      let pollInterval: ReturnType<typeof setInterval> | undefined;
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let clearTimers: () => void = () => undefined;
       const finish = (nextState: ServiceTestState, toastMsg: string, toastType: 'success' | 'error') => {
         if (!isActive) return;
         isActive = false;
-        if (pollInterval) clearInterval(pollInterval);
-        if (timeoutId) clearTimeout(timeoutId);
+        clearTimers();
         updateServiceTest(key, nextState);
         show({ message: toastMsg, type: toastType });
       };
 
-      pollInterval = setInterval(async () => {
+      const pollInterval = setInterval(async () => {
         try {
           const statusResponse = await api.getTestStatus(taskId);
           const statusData = statusResponse.data;
@@ -283,9 +281,13 @@ export const Settings: React.FC = () => {
         }
       }, 2000);
 
-      timeoutId = setTimeout(() => {
+      const timeoutId = setTimeout(() => {
         finish({ status: 'error', message: t('settings.serviceTest.testTimeout') }, t('settings.serviceTest.testTimeout'), 'error');
       }, 600000);
+      clearTimers = () => {
+        clearInterval(pollInterval);
+        clearTimeout(timeoutId);
+      };
     } catch (error: any) {
       const errorMessage = error?.response?.data?.error?.message || error?.message || t('settings.messages.unknownError');
       updateServiceTest(key, { status: 'error', message: errorMessage });
