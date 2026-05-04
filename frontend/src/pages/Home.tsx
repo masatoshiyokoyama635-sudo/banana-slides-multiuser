@@ -242,19 +242,6 @@ export const Home: React.FC = () => {
     loadTemplates();
   }, []);
 
-  // 首次访问自动弹出帮助模态框
-  useEffect(() => {
-    const hasSeenHelp = localStorage.getItem('hasSeenHelpModal');
-    if (!hasSeenHelp) {
-      // 延迟500ms打开，让页面先渲染完成
-      const timer = setTimeout(() => {
-        setIsHelpModalOpen(true);
-        localStorage.setItem('hasSeenHelpModal', 'true');
-      }, 500);
-      return () => clearTimeout(timer);
-    }
-  }, []);
-
   const handleOpenMaterialModal = () => {
     // 在主页始终生成全局素材，不关联任何项目
     setIsMaterialModalOpen(true);
